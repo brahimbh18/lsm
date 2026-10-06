@@ -10,7 +10,7 @@ import (
 type DB struct {
 	wal               *wal.WAL
 	memtable          *memtable.MemTable
-	flushing_memtable []*memtable.MemTable
+	frozenMemtables []*memtable.MemTable
 	options           Options
 }
 
@@ -64,7 +64,7 @@ func (db *DB) Put(key, value []byte) error {
 	// Check if the current MemTable has reached its maximum size.
 	if db.memtable.IsFull() {
 		// Freeze the current MemTable and create a new one.
-		db.flushing_memtable = append(db.flushing_memtable, db.memtable)
+		db.frozenMemtable = append(db.frozenMemtable, db.memtable)
 		db.memtable = memtable.New()
 	}
 	// 4. Acknowledge.
