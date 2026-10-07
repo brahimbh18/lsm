@@ -12,14 +12,15 @@ import (
 
 func main() {
 	db, err := engine.Open(engine.Options{
-		WALDir:   "data",
-		DataDir:  "data/tables",
+		WALDir:   envOrDefault("WAL_DIR", "data"),
+		DataDir:  envOrDefault("DATA_DIR", "data/tables"),
 		SyncMode: engine.SyncModeSync,
 	})
 
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	defer db.Close()
 
 	scanner := bufio.NewScanner(os.Stdin)
@@ -83,4 +84,11 @@ func main() {
 	if err := scanner.Err(); err != nil {
 		fmt.Println("Input error:", err)
 	}
+}
+
+func envOrDefault(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }

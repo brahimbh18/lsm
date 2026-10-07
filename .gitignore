@@ -1,0 +1,8 @@
+# Local configuration
+.env
+
+# Runtime WALs and SSTables
+data/*
+
+# Local build binary
+/lsm
