@@ -23,10 +23,10 @@ type MemTable struct {
 	maxSize int
 }
 
-func New() *MemTable {
+func New(maxSize int) *MemTable {
 	return &MemTable{
 		entries: make([]Entry, 0),
-		maxSize: MaxSize,
+		maxSize: maxSize,
 	}
 }
 
@@ -73,6 +73,20 @@ func (m *MemTable) Get(key []byte) ([]byte, bool) {
 	}
 
 	return bytes.Clone(m.entries[i].Value), true
+}
+
+func (m *MemTable) Entries() []Entry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	entries := make([]Entry, len(m.entries))
+	for index, entry := range m.entries {
+		entries[index] = Entry{
+			Key:   bytes.Clone(entry.Key),
+			Value: bytes.Clone(entry.Value),
+		}
+	}
+	return entries
 }
 
 func (m *MemTable) Size() int {
