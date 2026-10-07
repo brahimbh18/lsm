@@ -12,7 +12,8 @@ import (
 
 func main() {
 	db, err := engine.Open(engine.Options{
-		WALPath:  "data/wal.log",
+		WALDir:   "data",
+		DataDir:  "data/tables",
 		SyncMode: engine.SyncModeSync,
 	})
 

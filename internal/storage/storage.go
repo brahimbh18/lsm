@@ -16,6 +16,11 @@ type Storage struct {
 	mu        sync.Mutex
 }
 
+type WriteResult struct {
+	Path string
+	Size int64
+}
+
 func NewStorage(directory string) (*Storage, error) {
 	if err := os.MkdirAll(directory, 0755); err != nil {
 		return nil, err
@@ -30,34 +35,39 @@ func NewStorage(directory string) (*Storage, error) {
 }
 
 func (s *Storage) Write(table *SSTable) error {
+	_, err := s.WriteWithInfo(table)
+	return err
+}
+
+func (s *Storage) WriteWithInfo(table *SSTable) (WriteResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	path := filepath.Join(s.directory, fmt.Sprintf("%06d.sst", s.nextID))
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644)
 	if err != nil {
-		return err
+		return WriteResult{}, err
 	}
 
 	written, err := file.Write(table.Data)
 	if err != nil {
 		_ = file.Close()
-		return err
+		return WriteResult{}, err
 	}
 	if written != len(table.Data) {
 		_ = file.Close()
-		return io.ErrShortWrite
+		return WriteResult{}, io.ErrShortWrite
 	}
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
-		return err
+		return WriteResult{}, err
 	}
 	if err := file.Close(); err != nil {
-		return err
+		return WriteResult{}, err
 	}
 
 	s.nextID++
-	return nil
+	return WriteResult{Path: path, Size: int64(len(table.Data))}, nil
 }
 
 func nextTableID(directory string) (uint64, error) {

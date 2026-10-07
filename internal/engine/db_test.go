@@ -9,7 +9,7 @@ import (
 
 func testOptions(directory string) Options {
 	return Options{
-		WALPath:         filepath.Join(directory, "wal.log"),
+		WALDir:          filepath.Join(directory, "wal"),
 		DataDir:         filepath.Join(directory, "tables"),
 		MemTableMaxSize: 10,
 	}
@@ -21,12 +21,12 @@ func TestPutFlushesFrozenMemTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
-	oldMemtable := db.memtable
+	oldMemtable := db.active.table
 
 	if err := db.Put([]byte("key"), []byte("value!!!")); err != nil {
 		t.Fatalf("Put() error = %v", err)
 	}
-	if db.memtable == oldMemtable {
+	if db.active.table == oldMemtable {
 		t.Fatal("full MemTable was not replaced")
 	}
 

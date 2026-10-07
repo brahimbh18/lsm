@@ -9,7 +9,6 @@ import (
 
 var ErrImmutable = errors.New("cannot write to immutable memtable")
 
-const MaxSize = 16 * 1024 * 1024 // 16 MiB
 type Entry struct {
 	Key   []byte
 	Value []byte

@@ -54,7 +54,7 @@ func TestBuilderSplitsBlocks(t *testing.T) {
 		{Key: []byte("b"), Value: bytes.Repeat([]byte{'b'}, 3000)},
 		{Key: []byte("c"), Value: bytes.Repeat([]byte{'c'}, 3000)},
 	}
-	table := memtable.New(memtable.MaxSize)
+	table := memtable.New(16 * 1024 * 1024)
 	for _, entry := range entries {
 		if err := table.Put(entry.Key, entry.Value); err != nil {
 			t.Fatalf("Put() error = %v", err)
@@ -81,7 +81,7 @@ func TestBuilderSplitsBlocks(t *testing.T) {
 	}
 
 	largeEntry := memtable.Entry{Key: []byte("large"), Value: bytes.Repeat([]byte{'x'}, MaxBlockSize+1)}
-	largeTable := memtable.New(memtable.MaxSize)
+	largeTable := memtable.New(16 * 1024 * 1024)
 	if err := largeTable.Put(largeEntry.Key, largeEntry.Value); err != nil {
 		t.Fatalf("large Put() error = %v", err)
 	}
@@ -111,7 +111,7 @@ func TestEncodeBlock(t *testing.T) {
 }
 
 func TestBuilderSSTableLayout(t *testing.T) {
-	table := memtable.New(memtable.MaxSize)
+	table := memtable.New(16 * 1024 * 1024)
 	_ = table.Put([]byte("a"), bytes.Repeat([]byte{'a'}, MaxBlockSize))
 	_ = table.Put([]byte("b"), bytes.Repeat([]byte{'b'}, MaxBlockSize))
 	blocks := SplitBlocks(table.Entries())
