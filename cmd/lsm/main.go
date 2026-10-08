@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"lsm/internal/engine"
@@ -13,7 +14,7 @@ import (
 func main() {
 	db, err := engine.Open(engine.Options{
 		WALDir:   envOrDefault("WAL_DIR", "data"),
-		DataDir:  envOrDefault("DATA_DIR", "data/tables"),
+		DataDir:  envOrDefault("DATA_DIR", filepath.Join("data", "tables")),
 		SyncMode: engine.SyncModeSync,
 	})
 

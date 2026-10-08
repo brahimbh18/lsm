@@ -62,10 +62,11 @@ type DB struct {
 
 func Open(options Options) (*DB, error) {
 	if options.WALDir == "" {
-		if options.WALPath == "" {
-			return nil, errors.New("WAL directory is required")
+		if options.WALPath != "" {
+			options.WALDir = filepath.Dir(options.WALPath)
+		} else {
+			options.WALDir = "data"
 		}
-		options.WALDir = filepath.Dir(options.WALPath)
 	}
 	if options.DataDir == "" {
 		options.DataDir = filepath.Join(options.WALDir, "tables")
@@ -75,7 +76,10 @@ func Open(options Options) (*DB, error) {
 	}
 
 	if err := os.MkdirAll(options.WALDir, 0755); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create data directory: %w", err)
+	}
+	if err := os.MkdirAll(options.DataDir, 0755); err != nil {
+		return nil, fmt.Errorf("create tables directory: %w", err)
 	}
 	walIDs, err := walIDs(options.WALDir)
 	if err != nil {
