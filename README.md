@@ -1,0 +1,153 @@
+# LSM Key-Value Store
+
+An educational Log-Structured Merge-tree (LSM) key-value store in Go.
+
+## Architecture
+
+The project maintains a clean separation between the storage engine internals and the HTTP adapter layer:
+
+```text
+                 External programs / curl
+                  │         │          │
+                  │   HTTP  │          │
+                  ▼         ▼          ▼
+              ┌───────────────────────────┐
+              │        HTTP Server        │
+              │   (internal/server)       │
+              │                           │
+              │   PUT /kv/:key            │
+              │   GET /kv/:key            │
+              │   GET /health             │
+              └─────────────┬─────────────┘
+                            │
+                            ▼
+                      ┌───────────┐
+                      │ engine.DB │
+                      └─────┬─────┘
+                            │
+             ┌──────────────┼──────────────┐
+             ▼              ▼              ▼
+         MemTables         WAL        L0 SSTables
+             │
+             ▼
+        Flush Worker
+```
+
+- **HTTP Server**: A thin adapter translating incoming JSON HTTP requests into calls to `engine.DB`. It does not contain storage logic or server-level mutexes; synchronization is delegated to `engine.DB`.
+- **engine.DB**: Coordinates active and frozen MemTables, WAL logging, and background SSTable flushes.
+
+---
+
+## Starting the Server
+
+Build and start the server using `cmd/lsm-server`:
+
+```bash
+go run ./cmd/lsm-server --addr :8080 --data-dir ./data
+```
+
+Command-line flags:
+- `--addr`: HTTP listen address (default: `:8080`).
+- `--data-dir`: Base directory for WAL and SSTable storage (default: `./data`).
+
+At startup, the server prints:
+```text
+LSM server listening on :8080
+data directory: ./data
+```
+
+The server cleanly shuts down on `SIGINT` (Ctrl+C) and `SIGTERM`:
+1. Ceases accepting new HTTP requests.
+2. Gracefully finishes in-flight requests.
+3. Closes `engine.DB` and drains background flush workers before process exit.
+
+---
+
+## Interacting with the Server (curl)
+
+### Health Check
+
+```bash
+curl http://localhost:8080/health
+```
+
+Response:
+```json
+{"status":"ok"}
+```
+
+### Put a Key-Value Pair
+
+```bash
+curl -X PUT \
+  -H 'Content-Type: application/json' \
+  -d '{"value":"hello"}' \
+  http://localhost:8080/kv/foo
+```
+
+Response:
+```json
+{"key":"foo","status":"ok"}
+```
+
+### Get a Key
+
+```bash
+curl http://localhost:8080/kv/foo
+```
+
+Response:
+```json
+{"key":"foo","value":"hello"}
+```
+
+### Get a Missing Key
+
+```bash
+curl -i http://localhost:8080/kv/does-not-exist
+```
+
+Response:
+```http
+HTTP/1.1 404 Not Found
+Content-Type: application/json
+
+{"error":"key not found"}
+```
+
+---
+
+## Client Example
+
+A simple client program demonstrates controlling the store from a separate process:
+
+```bash
+go run ./examples/client --addr http://localhost:8080
+```
+
+Output:
+```text
+PUT foo=hello
+GET foo → hello
+
+PUT bar=world
+GET bar → world
+
+GET missing → 404
+```
+
+---
+
+## Running Tests
+
+Run all unit tests:
+
+```bash
+go test ./...
+```
+
+Run tests with data race detection:
+
+```bash
+go test -race ./...
+```

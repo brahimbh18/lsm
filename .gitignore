@@ -6,3 +6,5 @@ data/*
 
 # Local build binary
 /lsm
+/lsm-server
+bin/
