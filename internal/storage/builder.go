@@ -8,6 +8,7 @@ import (
 )
 
 var ErrRecordTooLarge = errors.New("record field exceeds uint32 length")
+var ErrMalformedRecord = errors.New("malformed SSTable record")
 
 type Builder struct {
 }
@@ -71,12 +72,64 @@ func SplitBlocks(entries []memtable.Entry) []Block {
 }
 
 func EncodeRecord(entry memtable.Entry) []byte {
-	data := make([]byte, 8+len(entry.Key)+len(entry.Value))
+	data := make([]byte, 16+len(entry.Key)+len(entry.Value))
 	binary.BigEndian.PutUint32(data[0:4], uint32(len(entry.Key)))
 	binary.BigEndian.PutUint32(data[4:8], uint32(len(entry.Value)))
-	copy(data[8:], entry.Key)
-	copy(data[8+len(entry.Key):], entry.Value)
+	binary.BigEndian.PutUint64(data[8:16], entry.Seq)
+	copy(data[16:], entry.Key)
+	copy(data[16+len(entry.Key):], entry.Value)
 	return data
+}
+
+func DecodeRecord(data []byte) (memtable.Entry, int, error) {
+	if len(data) < 16 {
+		return memtable.Entry{}, 0, ErrMalformedRecord
+	}
+	keyLen := uint64(binary.BigEndian.Uint32(data[0:4]))
+	valueLen := uint64(binary.BigEndian.Uint32(data[4:8]))
+	recordLen := uint64(16) + keyLen + valueLen
+	if recordLen > uint64(len(data)) {
+		return memtable.Entry{}, 0, ErrMalformedRecord
+	}
+	keyEnd := 16 + int(keyLen)
+	return memtable.Entry{
+		Key:   append([]byte(nil), data[16:keyEnd]...),
+		Value: append([]byte(nil), data[keyEnd:int(recordLen)]...),
+		Seq:   binary.BigEndian.Uint64(data[8:16]),
+	}, int(recordLen), nil
+}
+
+func MaxSequence(data []byte) (uint64, error) {
+	if len(data) < 16 {
+		return 0, ErrMalformedRecord
+	}
+	footerStart := len(data) - 16
+	indexOffset := binary.BigEndian.Uint64(data[footerStart : footerStart+8])
+	indexSize := binary.BigEndian.Uint64(data[footerStart+8:])
+	if indexOffset > uint64(footerStart) || indexSize != uint64(footerStart)-indexOffset || indexSize%16 != 0 {
+		return 0, ErrMalformedRecord
+	}
+
+	var maximum uint64
+	for offset := indexOffset; offset < indexOffset+indexSize; offset += 16 {
+		blockOffset := binary.BigEndian.Uint64(data[offset : offset+8])
+		blockSize := binary.BigEndian.Uint64(data[offset+8 : offset+16])
+		if blockOffset > indexOffset || blockSize > indexOffset-blockOffset {
+			return 0, ErrMalformedRecord
+		}
+		blockEnd := blockOffset + blockSize
+		for recordOffset := blockOffset; recordOffset < blockEnd; {
+			entry, recordSize, err := DecodeRecord(data[recordOffset:blockEnd])
+			if err != nil || recordSize <= 0 {
+				return 0, ErrMalformedRecord
+			}
+			if entry.Seq > maximum {
+				maximum = entry.Seq
+			}
+			recordOffset += uint64(recordSize)
+		}
+	}
+	return maximum, nil
 }
 
 func EncodeBlock(block Block) []byte {

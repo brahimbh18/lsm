@@ -1,29 +1,29 @@
 package wal
 
 import (
-    "encoding/binary"
-    "hash/crc32"
+	"encoding/binary"
+	"hash/crc32"
+
+	"lsm/internal/memtable"
 )
 
-const headerSize = 8
+const headerSize = 16
 const checksumSize = 4
 
-func encode(key, value []byte) []byte {
-    size := headerSize + len(key) + len(value) + checksumSize
-    buf := make([]byte, size)
+func encode(entry memtable.Entry) []byte {
+	size := headerSize + len(entry.Key) + len(entry.Value) + checksumSize
+	buf := make([]byte, size)
 
-    binary.BigEndian.PutUint32(buf[0:4], uint32(len(key)))
-    binary.BigEndian.PutUint32(buf[4:8], uint32(len(value)))
+	binary.BigEndian.PutUint32(buf[0:4], uint32(len(entry.Key)))
+	binary.BigEndian.PutUint32(buf[4:8], uint32(len(entry.Value)))
+	binary.BigEndian.PutUint64(buf[8:16], entry.Seq)
 
-    copy(buf[8:], key)
-    copy(buf[8+len(key):], value)
+	copy(buf[headerSize:], entry.Key)
+	copy(buf[headerSize+len(entry.Key):], entry.Value)
 
-    checksum := crc32.ChecksumIEEE(buf[:size-checksumSize])
+	checksum := crc32.ChecksumIEEE(buf[:size-checksumSize])
 
-    binary.BigEndian.PutUint32(
-        buf[size-checksumSize:],
-        checksum,
-    )
+	binary.BigEndian.PutUint32(buf[size-checksumSize:], checksum)
 
-    return buf
+	return buf
 }

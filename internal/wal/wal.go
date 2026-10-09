@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"sync"
+
+	"lsm/internal/memtable"
 )
 
 var ErrCorruptRecord = errors.New("corrupt WAL record")
@@ -35,11 +37,18 @@ func (w *WAL) Path() string {
 	return w.path
 }
 
-func (w *WAL) Append(key, value []byte) error {
+func (w *WAL) Append(key, value []byte, sequences ...uint64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	record := encode(key, value)
+	if len(sequences) > 1 {
+		return ErrInvalidSequence
+	}
+	var seq uint64
+	if len(sequences) == 1 {
+		seq = sequences[0]
+	}
+	record := encode(memtable.Entry{Key: key, Value: value, Seq: seq})
 
 	n, err := w.file.Write(record)
 	if err != nil {
@@ -67,7 +76,7 @@ func (w *WAL) Close() error {
 	return w.file.Close()
 }
 
-func (w *WAL) Replay(fn func(key, value []byte) error) error {
+func (w *WAL) Replay(fn func(memtable.Entry) error) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -94,6 +103,7 @@ func (w *WAL) Replay(fn func(key, value []byte) error) error {
 
 		keyLen := binary.BigEndian.Uint32(header[:4])
 		valueLen := binary.BigEndian.Uint32(header[4:8])
+		seq := binary.BigEndian.Uint64(header[8:16])
 
 		// Prevent unreasonable allocations from corrupt lengths.
 		if uint64(keyLen)+uint64(valueLen) > 64*1024*1024 {
@@ -124,7 +134,7 @@ func (w *WAL) Replay(fn func(key, value []byte) error) error {
 		key := payload[:keyLen]
 		value := payload[keyLen : keyLen+valueLen]
 
-		if err := fn(key, value); err != nil {
+		if err := fn(memtable.Entry{Key: key, Value: value, Seq: seq}); err != nil {
 			return err
 		}
 	}

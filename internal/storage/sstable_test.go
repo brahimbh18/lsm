@@ -14,15 +14,15 @@ func TestEncodeRecord(t *testing.T) {
 		entry memtable.Entry
 	}{
 		{name: "empty", entry: memtable.Entry{}},
-		{name: "normal", entry: memtable.Entry{Key: []byte("cat"), Value: []byte("black")}},
+		{name: "normal", entry: memtable.Entry{Key: []byte("cat"), Value: []byte("black"), Seq: 42}},
 		{name: "large", entry: memtable.Entry{Key: bytes.Repeat([]byte{'k'}, 256), Value: bytes.Repeat([]byte{'v'}, 512)}},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			encoded := EncodeRecord(test.entry)
-			if len(encoded) != 8+len(test.entry.Key)+len(test.entry.Value) {
-				t.Fatalf("encoded length = %d, want %d", len(encoded), 8+len(test.entry.Key)+len(test.entry.Value))
+			if len(encoded) != 16+len(test.entry.Key)+len(test.entry.Value) {
+				t.Fatalf("encoded length = %d, want %d", len(encoded), 16+len(test.entry.Key)+len(test.entry.Value))
 			}
 			if got := binary.BigEndian.Uint32(encoded[0:4]); got != uint32(len(test.entry.Key)) {
 				t.Fatalf("key length = %d, want %d", got, len(test.entry.Key))
@@ -30,11 +30,18 @@ func TestEncodeRecord(t *testing.T) {
 			if got := binary.BigEndian.Uint32(encoded[4:8]); got != uint32(len(test.entry.Value)) {
 				t.Fatalf("value length = %d, want %d", got, len(test.entry.Value))
 			}
-			if !bytes.Equal(encoded[8:8+len(test.entry.Key)], test.entry.Key) {
+			if got := binary.BigEndian.Uint64(encoded[8:16]); got != test.entry.Seq {
+				t.Fatalf("sequence = %d, want %d", got, test.entry.Seq)
+			}
+			if !bytes.Equal(encoded[16:16+len(test.entry.Key)], test.entry.Key) {
 				t.Fatal("encoded key does not match")
 			}
-			if !bytes.Equal(encoded[8+len(test.entry.Key):], test.entry.Value) {
+			if !bytes.Equal(encoded[16+len(test.entry.Key):], test.entry.Value) {
 				t.Fatal("encoded value does not match")
+			}
+			decoded, size, err := DecodeRecord(encoded)
+			if err != nil || size != len(encoded) || !bytes.Equal(decoded.Key, test.entry.Key) || !bytes.Equal(decoded.Value, test.entry.Value) || decoded.Seq != test.entry.Seq {
+				t.Fatalf("DecodeRecord() = %+v, size %d, error %v", decoded, size, err)
 			}
 		})
 	}
@@ -42,7 +49,7 @@ func TestEncodeRecord(t *testing.T) {
 	first := EncodeRecord(memtable.Entry{Key: []byte("a"), Value: []byte("1")})
 	second := EncodeRecord(memtable.Entry{Key: []byte("b"), Value: []byte("22")})
 	concatenated := append(first, second...)
-	secondStart := 8 + len("a") + len("1")
+	secondStart := 16 + len("a") + len("1")
 	if !bytes.Equal(concatenated[secondStart:], second) {
 		t.Fatal("concatenated records are not self-delimiting")
 	}
@@ -107,6 +114,16 @@ func TestEncodeBlock(t *testing.T) {
 	want := append(EncodeRecord(block.Records[0]), EncodeRecord(block.Records[1])...)
 	if got := EncodeBlock(block); !bytes.Equal(got, want) {
 		t.Fatalf("encoded block = %x, want %x", got, want)
+	}
+}
+
+func TestDecodeRecordRejectsMalformedInput(t *testing.T) {
+	if _, _, err := DecodeRecord([]byte{1, 2, 3}); err != ErrMalformedRecord {
+		t.Fatalf("DecodeRecord() error = %v, want %v", err, ErrMalformedRecord)
+	}
+	record := EncodeRecord(memtable.Entry{Key: []byte("key"), Value: []byte("value"), Seq: 3})
+	if _, _, err := DecodeRecord(record[:len(record)-1]); err != ErrMalformedRecord {
+		t.Fatalf("truncated DecodeRecord() error = %v, want %v", err, ErrMalformedRecord)
 	}
 }
 

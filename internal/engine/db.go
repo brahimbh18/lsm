@@ -18,9 +18,10 @@ import (
 var ErrClosed = errors.New("database is closed")
 
 type memTableState struct {
-	id    uint64
-	table *memtable.MemTable
-	wal   *wal.WAL
+	id        uint64
+	table     *memtable.MemTable
+	wal       *wal.WAL
+	walClosed bool
 }
 
 type flushTask struct {
@@ -43,7 +44,7 @@ type FlushStats struct {
 }
 
 type DB struct {
-	mu              sync.Mutex
+	mu              sync.RWMutex
 	queueMu         sync.Mutex
 	active          *memTableState
 	frozenMemtables []*flushTask
@@ -58,6 +59,8 @@ type DB struct {
 	stats           FlushStats
 	options         Options
 	closed          bool
+	lastSequence    uint64
+	flushPending    int
 }
 
 func Open(options Options) (*DB, error) {
@@ -105,6 +108,20 @@ func Open(options Options) (*DB, error) {
 	}
 	db.flushCond = sync.NewCond(&db.mu)
 
+	for id := range sstIDs {
+		data, err := os.ReadFile(filepath.Join(options.DataDir, fmt.Sprintf("%06d.sst", id)))
+		if err != nil {
+			return nil, err
+		}
+		sequence, err := storage.MaxSequence(data)
+		if err != nil {
+			return nil, fmt.Errorf("read SSTable %d: %w", id, err)
+		}
+		if sequence > db.lastSequence {
+			db.lastSequence = sequence
+		}
+	}
+
 	// Replay every WAL that has no corresponding SSTable. Until SSTable reads
 	// exist, replaying them into the active table is the explicit recovery limit.
 	for _, id := range walIDs {
@@ -121,16 +138,22 @@ func Open(options Options) (*DB, error) {
 			if err != nil {
 				return nil, err
 			}
-			err = recovered.Replay(func(key, value []byte) error {
-				return db.active.table.Put(key, value)
+			err = recovered.Replay(func(entry memtable.Entry) error {
+				if entry.Seq > db.lastSequence {
+					db.lastSequence = entry.Seq
+				}
+				return db.active.table.PutEntry(entry)
 			})
 			if err != nil {
 				_ = recovered.Close()
 				return nil, err
 			}
 		} else {
-			err = recovered.Replay(func(key, value []byte) error {
-				return db.active.table.Put(key, value)
+			err = recovered.Replay(func(entry memtable.Entry) error {
+				if entry.Seq > db.lastSequence {
+					db.lastSequence = entry.Seq
+				}
+				return db.active.table.PutEntry(entry)
 			})
 			if err != nil {
 				_ = recovered.Close()
@@ -175,12 +198,12 @@ func (db *DB) startFlushWorker() {
 		for task := range db.flushQueue {
 			db.log(1, "[FLUSH WORKER] RECEIVED memtable=%d wal=%s", task.state.id, task.state.wal.Path())
 			err := db.flush(task)
-			if err != nil {
-				_ = task.state.wal.Close()
-			}
 
 			db.mu.Lock()
-			db.removeFrozenMemtable(task)
+			if err != nil && !task.state.walClosed {
+				_ = task.state.wal.Close()
+				task.state.walClosed = true
+			}
 			if err != nil && db.flushErr == nil {
 				db.flushErr = err
 			}
@@ -188,6 +211,7 @@ func (db *DB) startFlushWorker() {
 				db.stats.MemTablesFlushed++
 				db.stats.L0SSTablesCreated++
 			}
+			db.flushPending--
 			db.flushCond.Broadcast()
 			db.mu.Unlock()
 			select {
@@ -211,7 +235,13 @@ func (db *DB) Put(key, value []byte) error {
 		db.mu.Unlock()
 		return err
 	}
-	if err := db.active.wal.Append(key, value); err != nil {
+	if db.lastSequence == ^uint64(0) {
+		db.mu.Unlock()
+		return ErrSequenceOverflow
+	}
+	db.lastSequence++
+	sequence := db.lastSequence
+	if err := db.active.wal.Append(key, value, sequence); err != nil {
 		db.mu.Unlock()
 		return err
 	}
@@ -221,7 +251,7 @@ func (db *DB) Put(key, value []byte) error {
 			return err
 		}
 	}
-	if err := db.active.table.Put(key, value); err != nil {
+	if err := db.active.table.PutEntry(memtable.Entry{Key: key, Value: value, Seq: sequence}); err != nil {
 		db.mu.Unlock()
 		return err
 	}
@@ -231,7 +261,9 @@ func (db *DB) Put(key, value []byte) error {
 	var frozen *flushTask
 	if db.active.table.IsFull() {
 		frozen = &flushTask{state: db.active}
+		db.active.table.Freeze()
 		db.frozenMemtables = append(db.frozenMemtables, frozen)
+		db.flushPending++
 		db.stats.MemTablesFrozen++
 		db.log(1, "[MEMTABLE] FULL id=%d size=%d threshold=%d", db.active.id, db.active.table.Size(), db.options.MemTableMaxSize)
 		db.log(1, "[MEMTABLE] FREEZE id=%d wal=%s entries=%d", db.active.id, db.active.wal.Path(), len(db.active.table.Entries()))
@@ -254,9 +286,18 @@ func (db *DB) Put(key, value []byte) error {
 }
 
 func (db *DB) Get(key []byte) ([]byte, bool) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-	return db.active.table.Get(key)
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if value, ok := db.active.table.Get(key); ok {
+		return value, true
+	}
+	for index := len(db.frozenMemtables) - 1; index >= 0; index-- {
+		if value, ok := db.frozenMemtables[index].state.table.Get(key); ok {
+			return value, true
+		}
+	}
+	return nil, false
 }
 
 func (db *DB) flush(task *flushTask) error {
@@ -275,6 +316,9 @@ func (db *DB) flush(task *flushTask) error {
 	if err := task.state.wal.Close(); err != nil {
 		return err
 	}
+	db.mu.Lock()
+	task.state.walClosed = true
+	db.mu.Unlock()
 	if err := os.Remove(task.state.wal.Path()); err != nil {
 		return err
 	}
@@ -288,15 +332,6 @@ func (db *DB) flush(task *flushTask) error {
 	return nil
 }
 
-func (db *DB) removeFrozenMemtable(task *flushTask) {
-	for i, frozen := range db.frozenMemtables {
-		if frozen == task {
-			db.frozenMemtables = append(db.frozenMemtables[:i], db.frozenMemtables[i+1:]...)
-			return
-		}
-	}
-}
-
 func (db *DB) log(level int, format string, args ...any) {
 	if db.options.DebugLogger != nil && db.options.DebugLevel >= level {
 		db.options.DebugLogger.Printf(format, args...)
@@ -306,7 +341,7 @@ func (db *DB) log(level int, format string, args ...any) {
 func (db *DB) WaitForFlushes() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	for len(db.frozenMemtables) > 0 {
+	for db.flushPending > 0 {
 		db.flushCond.Wait()
 	}
 	return db.flushErr
@@ -337,9 +372,13 @@ func (db *DB) Close() error {
 		activeErr = db.active.wal.Close()
 	}
 	for _, task := range db.frozenMemtables {
+		if task.state.walClosed {
+			continue
+		}
 		if err := task.state.wal.Close(); activeErr == nil && err != nil {
 			activeErr = err
 		}
+		task.state.walClosed = true
 	}
 	db.mu.Unlock()
 	return errors.Join(flushErr, activeErr)

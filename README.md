@@ -36,6 +36,18 @@ The project maintains a clean separation between the storage engine internals an
 - **HTTP Server**: A thin adapter translating incoming JSON HTTP requests into calls to `engine.DB`. It does not contain storage logic or server-level mutexes; synchronization is delegated to `engine.DB`.
 - **engine.DB**: Coordinates active and frozen MemTables, WAL logging, and background SSTable flushes.
 
+## Record formats
+
+Writes receive monotonically increasing sequence numbers from `engine.DB`. The WAL
+record format is a 16-byte big-endian header (`keyLen` uint32, `valueLen`
+uint32, `seq` uint64), followed by key bytes, value bytes, and the existing
+4-byte CRC-32 checksum. SSTable records use the same 16-byte header followed by
+key and value bytes. The index and footer formats are unchanged.
+
+This is an intentional on-disk format change. WAL and SSTable files written by
+older versions are not migrated and are rejected or otherwise not readable by
+this version; back up or recreate existing data before upgrading.
+
 ---
 
 ## Starting the Server

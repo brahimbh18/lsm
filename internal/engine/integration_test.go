@@ -109,9 +109,9 @@ func TestLargeWorkload(t *testing.T) {
 		found bool
 	}{
 		{"active MemTable", workloadRecords - 1, true},
-		{"flushed MemTable", 0, false},
-		{"earlier L0 SSTable", workloadRecords / 4, false},
-		{"later L0 SSTable", workloadRecords / 2, false},
+		{"flushed MemTable", 0, true},
+		{"earlier immutable MemTable", workloadRecords / 4, true},
+		{"later immutable MemTable", workloadRecords / 2, true},
 		{"missing", workloadRecords, false},
 	}
 	var latencies []time.Duration
@@ -133,7 +133,7 @@ func TestLargeWorkload(t *testing.T) {
 	t.Logf("========== QUERY RESULTS ==========")
 	t.Logf("Queries: %d, Found: %d, Not found: %d", len(queries), found, len(queries)-found)
 	t.Logf("Query latency: %s", summarizeLatencies(latencies))
-	t.Log("SSTable queries are not implemented; flushed-key misses are expected.")
+	t.Log("SSTable queries are not implemented; flushed data remains readable through immutable MemTables.")
 }
 
 func TestFlushFailureKeepsWAL(t *testing.T) {

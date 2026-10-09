@@ -12,6 +12,7 @@ var ErrImmutable = errors.New("cannot write to immutable memtable")
 type Entry struct {
 	Key   []byte
 	Value []byte
+	Seq   uint64
 }
 
 type MemTable struct {
@@ -30,6 +31,10 @@ func New(maxSize int) *MemTable {
 }
 
 func (m *MemTable) Put(key, value []byte) error {
+	return m.PutEntry(Entry{Key: key, Value: value})
+}
+
+func (m *MemTable) PutEntry(input Entry) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -38,15 +43,16 @@ func (m *MemTable) Put(key, value []byte) error {
 	}
 
 	i := sort.Search(len(m.entries), func(i int) bool {
-		return bytes.Compare(m.entries[i].Key, key) >= 0
+		return bytes.Compare(m.entries[i].Key, input.Key) >= 0
 	})
 
 	entry := Entry{
-		Key:   bytes.Clone(key),
-		Value: bytes.Clone(value),
+		Key:   bytes.Clone(input.Key),
+		Value: bytes.Clone(input.Value),
+		Seq:   input.Seq,
 	}
 
-	if i < len(m.entries) && bytes.Equal(m.entries[i].Key, key) {
+	if i < len(m.entries) && bytes.Equal(m.entries[i].Key, input.Key) {
 		m.size -= len(m.entries[i].Key) + len(m.entries[i].Value)
 		m.entries[i] = entry
 	} else {
@@ -55,7 +61,7 @@ func (m *MemTable) Put(key, value []byte) error {
 		m.entries[i] = entry
 	}
 
-	m.size += len(key) + len(value)
+	m.size += len(input.Key) + len(input.Value)
 	return nil
 }
 
@@ -83,6 +89,7 @@ func (m *MemTable) Entries() []Entry {
 		entries[index] = Entry{
 			Key:   bytes.Clone(entry.Key),
 			Value: bytes.Clone(entry.Value),
+			Seq:   entry.Seq,
 		}
 	}
 	return entries

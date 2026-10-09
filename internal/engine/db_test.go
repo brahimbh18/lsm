@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
+
+	"lsm/internal/memtable"
 )
 
 func testOptions(directory string) Options {
@@ -40,8 +43,11 @@ func TestPutFlushesFrozenMemTable(t *testing.T) {
 	db.mu.Lock()
 	frozenCount := len(db.frozenMemtables)
 	db.mu.Unlock()
-	if frozenCount != 0 {
-		t.Fatalf("frozen MemTables remaining = %d, want 0", frozenCount)
+	if frozenCount != 1 {
+		t.Fatalf("immutable MemTables remaining = %d, want 1", frozenCount)
+	}
+	if got, ok := db.Get([]byte("key")); !ok || !bytes.Equal(got, []byte("value!!!")) {
+		t.Fatalf("flushed key = %q, found=%v", got, ok)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
@@ -186,3 +192,167 @@ func TestOpenPreservesExistingData(t *testing.T) {
 	}
 }
 
+func TestConcurrentPutsHaveUniqueSequences(t *testing.T) {
+	db, err := Open(testOptions(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const writes = 100
+	var wait sync.WaitGroup
+	for i := 0; i < writes; i++ {
+		wait.Add(1)
+		go func(i int) {
+			defer wait.Done()
+			if err := db.Put([]byte{byte(i)}, []byte("value")); err != nil {
+				t.Errorf("Put() error = %v", err)
+			}
+		}(i)
+	}
+	wait.Wait()
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.lastSequence != writes {
+		t.Fatalf("last sequence = %d, want %d", db.lastSequence, writes)
+	}
+	seen := make(map[uint64]bool, writes)
+	for _, entry := range db.active.table.Entries() {
+		if seen[entry.Seq] {
+			t.Fatalf("duplicate sequence %d", entry.Seq)
+		}
+		seen[entry.Seq] = true
+	}
+}
+
+func TestRecoveryContinuesSequenceAfterFlush(t *testing.T) {
+	dir := t.TempDir()
+	options := testOptions(dir)
+	options.MemTableMaxSize = 1
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("first"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WaitForFlushes(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	options.MemTableMaxSize = 100
+	db, err = Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Put([]byte("second"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.lastSequence != 2 {
+		t.Fatalf("last sequence after recovery = %d, want 2", db.lastSequence)
+	}
+	if entries := db.active.table.Entries(); len(entries) != 1 || entries[0].Seq != 2 {
+		t.Fatalf("recovered active entries = %+v", entries)
+	}
+}
+
+func TestSequenceOverflow(t *testing.T) {
+	db, err := Open(testOptions(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.mu.Lock()
+	db.lastSequence = ^uint64(0)
+	db.mu.Unlock()
+	if err := db.Put([]byte("key"), []byte("value")); err != ErrSequenceOverflow {
+		t.Fatalf("Put() error = %v, want %v", err, ErrSequenceOverflow)
+	}
+}
+
+func TestGetPrefersNewestVisibleMemTable(t *testing.T) {
+	db, err := Open(testOptions(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	db.mu.Lock()
+	oldest := db.active
+	oldest.table.PutEntry(memtable.Entry{Key: []byte("key"), Value: []byte("oldest"), Seq: 1})
+	oldest.table.PutEntry(memtable.Entry{Key: []byte("older-only"), Value: []byte("older"), Seq: 2})
+	oldest.table.PutEntry(memtable.Entry{Key: []byte("versioned"), Value: []byte("old-version"), Seq: 2})
+	oldest.table.Freeze()
+	oldest.walClosed = true
+	db.frozenMemtables = append(db.frozenMemtables, &flushTask{state: oldest})
+	newest := &memTableState{table: memtable.New(1024), walClosed: true}
+	newest.table.PutEntry(memtable.Entry{Key: []byte("key"), Value: []byte("newest"), Seq: 2})
+	newest.table.PutEntry(memtable.Entry{Key: []byte("newer-only"), Value: []byte("newer"), Seq: 3})
+	newest.table.PutEntry(memtable.Entry{Key: []byte("versioned"), Value: []byte("new-version"), Seq: 3})
+	newest.table.Freeze()
+	db.frozenMemtables = append(db.frozenMemtables, &flushTask{state: newest})
+	db.active = &memTableState{table: memtable.New(1024)}
+	db.active.table.PutEntry(memtable.Entry{Key: []byte("key"), Value: []byte("active"), Seq: 4})
+	db.mu.Unlock()
+
+	got, ok := db.Get([]byte("key"))
+	if !ok || !bytes.Equal(got, []byte("active")) {
+		t.Fatalf("active Get() = %q, found=%v, want active value", got, ok)
+	}
+	if got, ok := db.Get([]byte("older-only")); !ok || !bytes.Equal(got, []byte("older")) {
+		t.Fatalf("older immutable Get() = %q, found=%v", got, ok)
+	}
+	if got, ok := db.Get([]byte("newer-only")); !ok || !bytes.Equal(got, []byte("newer")) {
+		t.Fatalf("newer immutable Get() = %q, found=%v", got, ok)
+	}
+	if got, ok := db.Get([]byte("versioned")); !ok || !bytes.Equal(got, []byte("new-version")) {
+		t.Fatalf("newest immutable Get() = %q, found=%v", got, ok)
+	}
+	if got, ok := db.Get([]byte("missing")); ok || got != nil {
+		t.Fatalf("missing Get() = %q, found=%v", got, ok)
+	}
+}
+
+func TestGetConcurrentWithPutsAndFreezes(t *testing.T) {
+	options := testOptions(t.TempDir())
+	options.MemTableMaxSize = 8
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var wait sync.WaitGroup
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		for i := 0; i < 100; i++ {
+			if err := db.Put([]byte("key"), []byte("value")); err != nil {
+				t.Errorf("Put() error = %v", err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wait.Done()
+		for i := 0; i < 500; i++ {
+			if value, ok := db.Get([]byte("key")); ok && !bytes.Equal(value, []byte("value")) {
+				t.Errorf("Get() = %q, want value", value)
+				return
+			}
+		}
+	}()
+	wait.Wait()
+	if err := db.WaitForFlushes(); err != nil {
+		t.Fatal(err)
+	}
+	if value, ok := db.Get([]byte("key")); !ok || !bytes.Equal(value, []byte("value")) {
+		t.Fatalf("final Get() = %q, found=%v", value, ok)
+	}
+}
