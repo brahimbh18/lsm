@@ -13,6 +13,23 @@ import (
 	"lsm/internal/engine"
 )
 
+type fakeStore struct {
+	values map[string][]byte
+}
+
+func (s *fakeStore) Put(key, value []byte) error {
+	if s.values == nil {
+		s.values = make(map[string][]byte)
+	}
+	s.values[string(key)] = bytes.Clone(value)
+	return nil
+}
+
+func (s *fakeStore) Get(key []byte) ([]byte, bool) {
+	value, ok := s.values[string(key)]
+	return bytes.Clone(value), ok
+}
+
 func setupTestDB(t *testing.T) *engine.DB {
 	t.Helper()
 	dir := t.TempDir()
@@ -30,6 +47,33 @@ func setupTestDB(t *testing.T) *engine.DB {
 		_ = db.Close()
 	})
 	return db
+}
+
+func TestServerUsesStoreBoundary(t *testing.T) {
+	store := &fakeStore{}
+	srv := New(store)
+
+	putReq := httptest.NewRequest(http.MethodPut, "/kv/foo", bytes.NewBufferString(`{"value":"bar"}`))
+	putRec := httptest.NewRecorder()
+	srv.ServeHTTP(putRec, putReq)
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want %d", putRec.Code, http.StatusOK)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/kv/foo", nil)
+	getRec := httptest.NewRecorder()
+	srv.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want %d", getRec.Code, http.StatusOK)
+	}
+
+	var response getResponse
+	if err := json.Unmarshal(getRec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode GET response: %v", err)
+	}
+	if response.Value != "bar" {
+		t.Fatalf("GET value = %q, want %q", response.Value, "bar")
+	}
 }
 
 func TestHealth(t *testing.T) {

@@ -33,7 +33,7 @@ The project maintains a clean separation between the storage engine internals an
         Flush Worker
 ```
 
-- **HTTP Server**: A thin adapter translating incoming JSON HTTP requests into calls to `engine.DB`. It does not contain storage logic or server-level mutexes; synchronization is delegated to `engine.DB`.
+- **HTTP Server**: A thin adapter translating incoming JSON HTTP requests into calls to its `server.Store` interface. The production implementation is `engine.DB`, but the adapter is not coupled to that concrete engine and does not contain storage logic or server-level mutexes.
 - **engine.DB**: Coordinates active and frozen MemTables, WAL logging, and background SSTable flushes.
 
 ## Record formats

@@ -17,14 +17,20 @@ type responseWriter struct {
 	statusCode int
 }
 
+// Store is the persistence boundary required by the HTTP adapter.
+type Store interface {
+	Put(key, value []byte) error
+	Get(key []byte) ([]byte, bool)
+}
+
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
 }
 
-// Server provides an HTTP interface on top of an engine.DB instance.
+// Server provides an HTTP interface on top of a Store.
 type Server struct {
-	db          *engine.DB
+	store       Store
 	mux         *http.ServeMux
 	debugLogger engine.DebugLogger
 	debugLevel  int
@@ -41,11 +47,11 @@ func WithDebug(logger engine.DebugLogger, level int) Option {
 	}
 }
 
-// New creates a new HTTP Server wrapping the provided DB instance.
-func New(db *engine.DB, opts ...Option) *Server {
+// New creates a new HTTP Server wrapping the provided Store.
+func New(db Store, opts ...Option) *Server {
 	s := &Server{
-		db:  db,
-		mux: http.NewServeMux(),
+		store: db,
+		mux:   http.NewServeMux(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -120,7 +126,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.db.Put([]byte(key), []byte(*req.Value)); err != nil {
+	if err := s.store.Put([]byte(key), []byte(*req.Value)); err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, engine.ErrClosed) {
 			status = http.StatusServiceUnavailable
@@ -147,7 +153,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	value, ok := s.db.Get([]byte(key))
+	value, ok := s.store.Get([]byte(key))
 	if !ok {
 		writeError(w, http.StatusNotFound, "key not found")
 		return
