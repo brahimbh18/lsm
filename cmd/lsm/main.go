@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -22,13 +23,20 @@ func main() {
 
 	defer db.Close()
 
-	scanner := bufio.NewScanner(os.Stdin)
+	runCLI(db, bufio.NewScanner(os.Stdin), os.Stdout)
+}
 
-	fmt.Println("LSM Database CLI")
-	fmt.Println("Commands: put <key> <value>, get <key>, exit")
+type store interface {
+	Put(key, value []byte) error
+	Get(key []byte) ([]byte, bool)
+	Delete(key []byte) error
+}
 
+func runCLI(db store, scanner *bufio.Scanner, output io.Writer) {
+	fmt.Fprintln(output, "LSM Database CLI")
+	fmt.Fprintln(output, "Commands: put <key> <value>, get <key>, del <key>, exit")
 	for {
-		fmt.Print("lsm> ")
+		fmt.Fprint(output, "lsm> ")
 
 		if !scanner.Scan() {
 			break
@@ -43,7 +51,7 @@ func main() {
 		switch input[0] {
 		case "put":
 			if len(input) < 3 {
-				fmt.Println("Usage: put <key> <value>")
+				fmt.Fprintln(output, "Usage: put <key> <value>")
 				continue
 			}
 
@@ -51,37 +59,50 @@ func main() {
 			value := []byte(strings.Join(input[2:], " "))
 
 			if err := db.Put(key, value); err != nil {
-				fmt.Println("Error:", err)
+				fmt.Fprintln(output, "Error:", err)
 				continue
 			}
 
-			fmt.Println("OK")
+			fmt.Fprintln(output, "OK")
 
 		case "get":
 			if len(input) != 2 {
-				fmt.Println("Usage: get <key>")
+				fmt.Fprintln(output, "Usage: get <key>")
 				continue
 			}
 
 			value, ok := db.Get([]byte(input[1]))
 
 			if ok {
-				fmt.Printf("%s\n", value)
+				fmt.Fprintf(output, "%s\n", value)
 			} else {
-				fmt.Println("(nil)")
+				fmt.Fprintln(output, "Key not found")
 			}
 
+		case "del":
+			if len(input) != 2 {
+				fmt.Fprintln(output, "Usage: del <key>")
+				continue
+			}
+
+			if err := db.Delete([]byte(input[1])); err != nil {
+				fmt.Fprintln(output, "Error:", err)
+				continue
+			}
+
+			fmt.Fprintln(output, "Deleted")
+
 		case "exit":
-			fmt.Println("Closing database...")
+			fmt.Fprintln(output, "Closing database...")
 			return
 
 		default:
-			fmt.Println("Unknown command:", input[0])
+			fmt.Fprintln(output, "Unknown command:", input[0])
 		}
 	}
 
 	if err := scanner.Err(); err != nil {
-		fmt.Println("Input error:", err)
+		fmt.Fprintln(output, "Input error:", err)
 	}
 }
 

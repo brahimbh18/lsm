@@ -13,7 +13,8 @@ import (
 )
 
 type fakeStore struct {
-	values map[string][]byte
+	values    map[string][]byte
+	deleteErr error
 }
 
 func (s *fakeStore) Put(key, value []byte) error {
@@ -27,6 +28,14 @@ func (s *fakeStore) Put(key, value []byte) error {
 func (s *fakeStore) Get(key []byte) ([]byte, bool) {
 	value, ok := s.values[string(key)]
 	return bytes.Clone(value), ok
+}
+
+func (s *fakeStore) Delete(key []byte) error {
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
+	delete(s.values, string(key))
+	return nil
 }
 
 func setupTestDB(t *testing.T) *engine.DB {
@@ -156,6 +165,52 @@ func TestPutAndGet(t *testing.T) {
 	}
 	if resp.Value != "hello" {
 		t.Fatalf("expected value 'hello', got %q", resp.Value)
+	}
+}
+
+func TestDelete(t *testing.T) {
+	db := setupTestDB(t)
+	srv := New(db)
+
+	putReq := httptest.NewRequest(http.MethodPut, "/kv/foo", bytes.NewBufferString(`{"value":"hello"}`))
+	putRec := httptest.NewRecorder()
+	srv.ServeHTTP(putRec, putReq)
+	if putRec.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, want %d", putRec.Code, http.StatusOK)
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/kv/foo", nil)
+	deleteRec := httptest.NewRecorder()
+	srv.ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("DELETE status = %d, want %d: %s", deleteRec.Code, http.StatusOK, deleteRec.Body.String())
+	}
+
+	var response deleteResponse
+	if err := json.Unmarshal(deleteRec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode DELETE response: %v", err)
+	}
+	if response.Key != "foo" || response.Status != "deleted" {
+		t.Fatalf("DELETE response = %#v, want key foo and status deleted", response)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/kv/foo", nil)
+	getRec := httptest.NewRecorder()
+	srv.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusNotFound {
+		t.Fatalf("GET after DELETE status = %d, want %d", getRec.Code, http.StatusNotFound)
+	}
+}
+
+func TestDeleteMissingKeySucceeds(t *testing.T) {
+	srv := New(&fakeStore{})
+	req := httptest.NewRequest(http.MethodDelete, "/kv/missing", nil)
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE missing key status = %d, want %d", rec.Code, http.StatusOK)
 	}
 }
 

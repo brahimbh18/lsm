@@ -21,6 +21,7 @@ type responseWriter struct {
 type Store interface {
 	Put(key, value []byte) error
 	Get(key []byte) ([]byte, bool)
+	Delete(key []byte) error
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
@@ -64,6 +65,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /health", s.handleHealth)
 	s.mux.HandleFunc("GET /kv/{key}", s.handleGet)
 	s.mux.HandleFunc("PUT /kv/{key}", s.handlePut)
+	s.mux.HandleFunc("DELETE /kv/{key}", s.handleDelete)
 }
 
 // Handler returns the underlying http.Handler.
@@ -162,6 +164,33 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, getResponse{
 		Key:   key,
 		Value: string(value),
+	})
+}
+
+type deleteResponse struct {
+	Key    string `json:"key"`
+	Status string `json:"status"`
+}
+
+func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	if key == "" {
+		writeError(w, http.StatusBadRequest, "key is required")
+		return
+	}
+
+	if err := s.store.Delete([]byte(key)); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, engine.ErrClosed) {
+			status = http.StatusServiceUnavailable
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, deleteResponse{
+		Key:    key,
+		Status: "deleted",
 	})
 }
 

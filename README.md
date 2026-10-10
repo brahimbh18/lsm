@@ -17,6 +17,7 @@ The project maintains a clean separation between the storage engine internals an
               │                           │
               │   PUT /kv/:key            │
               │   GET /kv/:key            │
+              │   DELETE /kv/:key         │
               │   GET /health             │
               └─────────────┬─────────────┘
                             │
@@ -137,6 +138,20 @@ Content-Type: application/json
 
 {"error":"key not found"}
 ```
+
+### Delete a Key
+
+```bash
+curl -X DELETE http://localhost:8080/kv/foo
+```
+
+Response:
+```json
+{"key":"foo","status":"deleted"}
+```
+
+Deleting a key that does not exist is also successful. A later `GET` returns
+`404 Not Found`.
 
 ---
 
