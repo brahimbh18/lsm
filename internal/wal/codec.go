@@ -9,12 +9,17 @@ import (
 
 const headerSize = 16
 const checksumSize = 4
+const tombstoneFlag = uint32(1 << 31)
 
 func encode(entry memtable.Entry) []byte {
 	size := headerSize + len(entry.Key) + len(entry.Value) + checksumSize
 	buf := make([]byte, size)
 
-	binary.BigEndian.PutUint32(buf[0:4], uint32(len(entry.Key)))
+	keyLength := uint32(len(entry.Key))
+	if entry.Tombstone {
+		keyLength |= tombstoneFlag
+	}
+	binary.BigEndian.PutUint32(buf[0:4], keyLength)
 	binary.BigEndian.PutUint32(buf[4:8], uint32(len(entry.Value)))
 	binary.BigEndian.PutUint64(buf[8:16], entry.Seq)
 

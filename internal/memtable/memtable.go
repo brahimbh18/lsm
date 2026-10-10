@@ -10,9 +10,10 @@ import (
 var ErrImmutable = errors.New("cannot write to immutable memtable")
 
 type Entry struct {
-	Key   []byte
-	Value []byte
-	Seq   uint64
+	Key       []byte
+	Value     []byte
+	Seq       uint64
+	Tombstone bool
 }
 
 type MemTable struct {
@@ -47,9 +48,10 @@ func (m *MemTable) PutEntry(input Entry) error {
 	})
 
 	entry := Entry{
-		Key:   bytes.Clone(input.Key),
-		Value: bytes.Clone(input.Value),
-		Seq:   input.Seq,
+		Key:       bytes.Clone(input.Key),
+		Value:     bytes.Clone(input.Value),
+		Seq:       input.Seq,
+		Tombstone: input.Tombstone,
 	}
 
 	if i < len(m.entries) && bytes.Equal(m.entries[i].Key, input.Key) {
@@ -66,6 +68,14 @@ func (m *MemTable) PutEntry(input Entry) error {
 }
 
 func (m *MemTable) Get(key []byte) ([]byte, bool) {
+	entry, ok := m.Lookup(key)
+	if !ok || entry.Tombstone {
+		return nil, false
+	}
+	return entry.Value, true
+}
+
+func (m *MemTable) Lookup(key []byte) (Entry, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -74,10 +84,13 @@ func (m *MemTable) Get(key []byte) ([]byte, bool) {
 	})
 
 	if i == len(m.entries) || !bytes.Equal(m.entries[i].Key, key) {
-		return nil, false
+		return Entry{}, false
 	}
 
-	return bytes.Clone(m.entries[i].Value), true
+	entry := m.entries[i]
+	entry.Key = bytes.Clone(entry.Key)
+	entry.Value = bytes.Clone(entry.Value)
+	return entry, true
 }
 
 func (m *MemTable) Entries() []Entry {
@@ -87,9 +100,10 @@ func (m *MemTable) Entries() []Entry {
 	entries := make([]Entry, len(m.entries))
 	for index, entry := range m.entries {
 		entries[index] = Entry{
-			Key:   bytes.Clone(entry.Key),
-			Value: bytes.Clone(entry.Value),
-			Seq:   entry.Seq,
+			Key:       bytes.Clone(entry.Key),
+			Value:     bytes.Clone(entry.Value),
+			Seq:       entry.Seq,
+			Tombstone: entry.Tombstone,
 		}
 	}
 	return entries

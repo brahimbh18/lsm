@@ -218,6 +218,14 @@ func (db *DB) startFlushWorker() {
 }
 
 func (db *DB) Put(key, value []byte) error {
+	return db.write(key, value, false)
+}
+
+func (db *DB) Delete(key []byte) error {
+	return db.write(key, nil, true)
+}
+
+func (db *DB) write(key, value []byte, tombstone bool) error {
 	db.queueMu.Lock()
 	defer db.queueMu.Unlock()
 	db.mu.Lock()
@@ -236,7 +244,8 @@ func (db *DB) Put(key, value []byte) error {
 	}
 	db.lastSequence++
 	sequence := db.lastSequence
-	if err := db.active.wal.Append(key, value, sequence); err != nil {
+	entry := memtable.Entry{Key: key, Value: value, Seq: sequence, Tombstone: tombstone}
+	if err := db.active.wal.AppendEntry(entry); err != nil {
 		db.mu.Unlock()
 		return err
 	}
@@ -246,7 +255,7 @@ func (db *DB) Put(key, value []byte) error {
 			return err
 		}
 	}
-	if err := db.active.table.PutEntry(memtable.Entry{Key: key, Value: value, Seq: sequence}); err != nil {
+	if err := db.active.table.PutEntry(entry); err != nil {
 		db.mu.Unlock()
 		return err
 	}
@@ -284,12 +293,18 @@ func (db *DB) Get(key []byte) ([]byte, bool) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
-	if value, ok := db.active.table.Get(key); ok {
-		return value, true
+	if entry, ok := db.active.table.Lookup(key); ok {
+		if entry.Tombstone {
+			return nil, false
+		}
+		return entry.Value, true
 	}
 	for index := len(db.frozenMemtables) - 1; index >= 0; index-- {
-		if value, ok := db.frozenMemtables[index].state.table.Get(key); ok {
-			return value, true
+		if entry, ok := db.frozenMemtables[index].state.table.Lookup(key); ok {
+			if entry.Tombstone {
+				return nil, false
+			}
+			return entry.Value, true
 		}
 	}
 	return nil, false

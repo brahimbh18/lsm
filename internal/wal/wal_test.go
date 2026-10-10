@@ -35,6 +35,28 @@ func TestAppendReplayPreservesSequence(t *testing.T) {
 	}
 }
 
+func TestAppendReplayPreservesTombstone(t *testing.T) {
+	w, err := Open(filepath.Join(t.TempDir(), "wal.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	if err := w.AppendEntry(memtable.Entry{Key: []byte("key"), Seq: 7, Tombstone: true}); err != nil {
+		t.Fatal(err)
+	}
+	var got memtable.Entry
+	if err := w.Replay(func(entry memtable.Entry) error {
+		got = entry
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Key) != "key" || !got.Tombstone || got.Value != nil || got.Seq != 7 {
+		t.Fatalf("replayed tombstone = %+v", got)
+	}
+}
+
 func TestReplayRejectsCorruptRecord(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "wal.log")
 	w, err := Open(path)

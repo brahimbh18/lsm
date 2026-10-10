@@ -38,17 +38,24 @@ func (w *WAL) Path() string {
 }
 
 func (w *WAL) Append(key, value []byte, sequences ...uint64) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
+	entry := memtable.Entry{Key: key, Value: value}
 	if len(sequences) > 1 {
 		return ErrInvalidSequence
 	}
-	var seq uint64
 	if len(sequences) == 1 {
-		seq = sequences[0]
+		entry.Seq = sequences[0]
 	}
-	record := encode(memtable.Entry{Key: key, Value: value, Seq: seq})
+	return w.AppendEntry(entry)
+}
+
+func (w *WAL) AppendEntry(entry memtable.Entry) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if entry.Tombstone && len(entry.Value) != 0 {
+		return ErrCorruptRecord
+	}
+	record := encode(entry)
 
 	n, err := w.file.Write(record)
 	if err != nil {
@@ -101,9 +108,14 @@ func (w *WAL) Replay(fn func(memtable.Entry) error) error {
 			return err
 		}
 
-		keyLen := binary.BigEndian.Uint32(header[:4])
+		encodedKeyLen := binary.BigEndian.Uint32(header[:4])
+		tombstone := encodedKeyLen&tombstoneFlag != 0
+		keyLen := encodedKeyLen &^ tombstoneFlag
 		valueLen := binary.BigEndian.Uint32(header[4:8])
 		seq := binary.BigEndian.Uint64(header[8:16])
+		if tombstone && valueLen != 0 {
+			return ErrCorruptRecord
+		}
 
 		// Prevent unreasonable allocations from corrupt lengths.
 		if uint64(keyLen)+uint64(valueLen) > 64*1024*1024 {
@@ -133,8 +145,11 @@ func (w *WAL) Replay(fn func(memtable.Entry) error) error {
 
 		key := payload[:keyLen]
 		value := payload[keyLen : keyLen+valueLen]
+		if tombstone {
+			value = nil
+		}
 
-		if err := fn(memtable.Entry{Key: key, Value: value, Seq: seq}); err != nil {
+		if err := fn(memtable.Entry{Key: key, Value: value, Seq: seq, Tombstone: tombstone}); err != nil {
 			return err
 		}
 	}

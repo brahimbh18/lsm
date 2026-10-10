@@ -47,15 +47,17 @@ data/
 
 ## Record formats
 
-Writes receive monotonically increasing sequence numbers from `engine.DB`. The WAL
-record format is a 16-byte big-endian header (`keyLen` uint32, `valueLen`
-uint32, `seq` uint64), followed by key bytes, value bytes, and the existing
-4-byte CRC-32 checksum. SSTable records use the same 16-byte header followed by
-key and value bytes. The index and footer formats are unchanged.
+Writes receive monotonically increasing sequence numbers from `engine.DB`. The WAL record format is a 16-byte big-endian header (`keyLen` uint32,
+`valueLen` uint32, `seq` uint64), followed by key bytes, value bytes, and the
+existing 4-byte CRC-32 checksum. The high bit of `keyLen` marks a tombstone;
+tombstones must have a zero `valueLen`. SSTable records use the same header and
+tombstone flag, followed by key and value bytes. The index and footer formats
+are unchanged.
 
-This is an intentional on-disk format change. WAL and SSTable files written by
-older versions are not migrated and are rejected or otherwise not readable by
-this version; back up or recreate existing data before upgrading.
+This reserves key lengths with the high bit set and is an intentional on-disk
+format change for tombstone records. Existing records with ordinary key
+lengths remain readable; no migration is provided for old files containing
+reserved-length keys.
 
 ---
 

@@ -10,6 +10,8 @@ import (
 var ErrRecordTooLarge = errors.New("record field exceeds uint32 length")
 var ErrMalformedRecord = errors.New("malformed SSTable record")
 
+const tombstoneFlag = uint32(1 << 31)
+
 type Builder struct {
 }
 
@@ -20,8 +22,11 @@ func NewBuilder() *Builder {
 func (b *Builder) Build(table *memtable.MemTable) (*SSTable, error) {
 	entries := table.Entries()
 	for _, entry := range entries {
-		if uint64(len(entry.Key)) > uint64(^uint32(0)) || uint64(len(entry.Value)) > uint64(^uint32(0)) {
+		if uint64(len(entry.Key)) > uint64(tombstoneFlag-1) || uint64(len(entry.Value)) > uint64(^uint32(0)) {
 			return nil, ErrRecordTooLarge
+		}
+		if entry.Tombstone && len(entry.Value) != 0 {
+			return nil, ErrMalformedRecord
 		}
 	}
 
@@ -73,7 +78,11 @@ func SplitBlocks(entries []memtable.Entry) []Block {
 
 func EncodeRecord(entry memtable.Entry) []byte {
 	data := make([]byte, 16+len(entry.Key)+len(entry.Value))
-	binary.BigEndian.PutUint32(data[0:4], uint32(len(entry.Key)))
+	keyLength := uint32(len(entry.Key))
+	if entry.Tombstone {
+		keyLength |= tombstoneFlag
+	}
+	binary.BigEndian.PutUint32(data[0:4], keyLength)
 	binary.BigEndian.PutUint32(data[4:8], uint32(len(entry.Value)))
 	binary.BigEndian.PutUint64(data[8:16], entry.Seq)
 	copy(data[16:], entry.Key)
@@ -85,17 +94,27 @@ func DecodeRecord(data []byte) (memtable.Entry, int, error) {
 	if len(data) < 16 {
 		return memtable.Entry{}, 0, ErrMalformedRecord
 	}
-	keyLen := uint64(binary.BigEndian.Uint32(data[0:4]))
+	encodedKeyLen := binary.BigEndian.Uint32(data[0:4])
+	tombstone := encodedKeyLen&tombstoneFlag != 0
+	keyLen := uint64(encodedKeyLen &^ tombstoneFlag)
 	valueLen := uint64(binary.BigEndian.Uint32(data[4:8]))
+	if tombstone && valueLen != 0 {
+		return memtable.Entry{}, 0, ErrMalformedRecord
+	}
 	recordLen := uint64(16) + keyLen + valueLen
 	if recordLen > uint64(len(data)) {
 		return memtable.Entry{}, 0, ErrMalformedRecord
 	}
 	keyEnd := 16 + int(keyLen)
+	value := append([]byte(nil), data[keyEnd:int(recordLen)]...)
+	if tombstone {
+		value = nil
+	}
 	return memtable.Entry{
-		Key:   append([]byte(nil), data[16:keyEnd]...),
-		Value: append([]byte(nil), data[keyEnd:int(recordLen)]...),
-		Seq:   binary.BigEndian.Uint64(data[8:16]),
+		Key:       append([]byte(nil), data[16:keyEnd]...),
+		Value:     value,
+		Seq:       binary.BigEndian.Uint64(data[8:16]),
+		Tombstone: tombstone,
 	}, int(recordLen), nil
 }
 

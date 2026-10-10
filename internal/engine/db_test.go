@@ -318,6 +318,119 @@ func TestGetPrefersNewestVisibleMemTable(t *testing.T) {
 	}
 }
 
+func TestDeleteSemantics(t *testing.T) {
+	db, err := Open(testOptions(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Delete([]byte("key")); err != nil {
+		t.Fatal(err)
+	}
+	if value, ok := db.Get([]byte("key")); ok || value != nil {
+		t.Fatalf("deleted key = %q, found=%v", value, ok)
+	}
+	if err := db.Delete([]byte("missing")); err != nil {
+		t.Fatalf("Delete() missing key error = %v", err)
+	}
+	if err := db.Put([]byte("key"), []byte{}); err != nil {
+		t.Fatal(err)
+	}
+	if value, ok := db.Get([]byte("key")); !ok || value == nil || len(value) != 0 {
+		t.Fatalf("empty value = %q, found=%v", value, ok)
+	}
+}
+
+func TestDeleteTombstoneBlocksOlderMemTables(t *testing.T) {
+	db, err := Open(testOptions(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	db.mu.Lock()
+	oldest := db.active
+	_ = oldest.table.PutEntry(memtable.Entry{Key: []byte("key"), Value: []byte("old"), Seq: 1})
+	oldest.table.Freeze()
+	db.frozenMemtables = append(db.frozenMemtables, &flushTask{state: oldest})
+	db.active = &memTableState{table: memtable.New(1024)}
+	_ = db.active.table.PutEntry(memtable.Entry{Key: []byte("key"), Seq: 2, Tombstone: true})
+	db.mu.Unlock()
+
+	if value, ok := db.Get([]byte("key")); ok || value != nil {
+		t.Fatalf("tombstoned key = %q, found=%v", value, ok)
+	}
+}
+
+func TestDeleteSurvivesFlushAndRecovery(t *testing.T) {
+	dir := t.TempDir()
+	options := testOptions(dir)
+	options.MemTableMaxSize = 1
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WaitForFlushes(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Delete([]byte("key")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WaitForFlushes(); err != nil {
+		t.Fatal(err)
+	}
+	if value, ok := db.Get([]byte("key")); ok || value != nil {
+		t.Fatalf("flushed deleted key = %q, found=%v", value, ok)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if value, ok := db.Get([]byte("key")); ok || value != nil {
+		t.Fatalf("recovered flushed deleted key = %q, found=%v", value, ok)
+	}
+}
+
+func TestDeleteRecoveryFromWAL(t *testing.T) {
+	dir := t.TempDir()
+	options := testOptions(dir)
+	options.MemTableMaxSize = 1024
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Delete([]byte("key")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if value, ok := db.Get([]byte("key")); ok || value != nil {
+		t.Fatalf("WAL-recovered deleted key = %q, found=%v", value, ok)
+	}
+}
+
 func TestGetConcurrentWithPutsAndFreezes(t *testing.T) {
 	options := testOptions(t.TempDir())
 	options.MemTableMaxSize = 8
@@ -325,6 +438,7 @@ func TestGetConcurrentWithPutsAndFreezes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer db.Close()
 
 	var wait sync.WaitGroup
@@ -354,4 +468,31 @@ func TestGetConcurrentWithPutsAndFreezes(t *testing.T) {
 	if value, ok := db.Get([]byte("key")); !ok || !bytes.Equal(value, []byte("value")) {
 		t.Fatalf("final Get() = %q, found=%v", value, ok)
 	}
+}
+
+func TestConcurrentPutDelete(t *testing.T) {
+	db, err := Open(testOptions(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var wait sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wait.Add(1)
+		go func(i int) {
+			defer wait.Done()
+			key := []byte("key")
+			if i%2 == 0 {
+				if err := db.Put(key, []byte("value")); err != nil {
+					t.Errorf("Put() error = %v", err)
+				}
+				return
+			}
+			if err := db.Delete(key); err != nil {
+				t.Errorf("Delete() error = %v", err)
+			}
+		}(i)
+	}
+	wait.Wait()
 }

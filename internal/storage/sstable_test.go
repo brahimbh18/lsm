@@ -15,6 +15,7 @@ func TestEncodeRecord(t *testing.T) {
 	}{
 		{name: "empty", entry: memtable.Entry{}},
 		{name: "normal", entry: memtable.Entry{Key: []byte("cat"), Value: []byte("black"), Seq: 42}},
+		{name: "tombstone", entry: memtable.Entry{Key: []byte("cat"), Seq: 43, Tombstone: true}},
 		{name: "large", entry: memtable.Entry{Key: bytes.Repeat([]byte{'k'}, 256), Value: bytes.Repeat([]byte{'v'}, 512)}},
 	}
 
@@ -24,7 +25,11 @@ func TestEncodeRecord(t *testing.T) {
 			if len(encoded) != 16+len(test.entry.Key)+len(test.entry.Value) {
 				t.Fatalf("encoded length = %d, want %d", len(encoded), 16+len(test.entry.Key)+len(test.entry.Value))
 			}
-			if got := binary.BigEndian.Uint32(encoded[0:4]); got != uint32(len(test.entry.Key)) {
+			wantKeyLength := uint32(len(test.entry.Key))
+			if test.entry.Tombstone {
+				wantKeyLength |= 1 << 31
+			}
+			if got := binary.BigEndian.Uint32(encoded[0:4]); got != wantKeyLength {
 				t.Fatalf("key length = %d, want %d", got, len(test.entry.Key))
 			}
 			if got := binary.BigEndian.Uint32(encoded[4:8]); got != uint32(len(test.entry.Value)) {
@@ -40,7 +45,7 @@ func TestEncodeRecord(t *testing.T) {
 				t.Fatal("encoded value does not match")
 			}
 			decoded, size, err := DecodeRecord(encoded)
-			if err != nil || size != len(encoded) || !bytes.Equal(decoded.Key, test.entry.Key) || !bytes.Equal(decoded.Value, test.entry.Value) || decoded.Seq != test.entry.Seq {
+			if err != nil || size != len(encoded) || !bytes.Equal(decoded.Key, test.entry.Key) || !bytes.Equal(decoded.Value, test.entry.Value) || decoded.Seq != test.entry.Seq || decoded.Tombstone != test.entry.Tombstone {
 				t.Fatalf("DecodeRecord() = %+v, size %d, error %v", decoded, size, err)
 			}
 		})
