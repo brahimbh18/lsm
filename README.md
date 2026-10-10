@@ -129,27 +129,6 @@ Content-Type: application/json
 
 ---
 
-## Client Example
-
-A simple client program demonstrates controlling the store from a separate process:
-
-```bash
-go run ./examples/client --addr http://localhost:8080
-```
-
-Output:
-```text
-PUT foo=hello
-GET foo → hello
-
-PUT bar=world
-GET bar → world
-
-GET missing → 404
-```
-
----
-
 ## Running Tests
 
 Run all unit tests:
