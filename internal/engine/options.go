@@ -14,8 +14,6 @@ const (
 )
 
 type Options struct {
-	WALPath         string
-	WALDir          string
 	DataDir         string
 	MemTableMaxSize int
 	SyncMode        SyncMode

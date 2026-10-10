@@ -64,31 +64,26 @@ type DB struct {
 }
 
 func Open(options Options) (*DB, error) {
-	if options.WALDir == "" {
-		if options.WALPath != "" {
-			options.WALDir = filepath.Dir(options.WALPath)
-		} else {
-			options.WALDir = "data"
-		}
-	}
 	if options.DataDir == "" {
-		options.DataDir = filepath.Join(options.WALDir, "tables")
+		options.DataDir = "data"
 	}
+	walDir := filepath.Join(options.DataDir, "wal")
+	tablesDir := filepath.Join(options.DataDir, "tables")
 	if options.MemTableMaxSize <= 0 {
 		options.MemTableMaxSize = DefaultMemTableMaxSize
 	}
 
-	if err := os.MkdirAll(options.WALDir, 0755); err != nil {
+	if err := os.MkdirAll(walDir, 0755); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)
 	}
-	if err := os.MkdirAll(options.DataDir, 0755); err != nil {
+	if err := os.MkdirAll(tablesDir, 0755); err != nil {
 		return nil, fmt.Errorf("create tables directory: %w", err)
 	}
-	walIDs, err := walIDs(options.WALDir)
+	walIDs, err := walIDs(walDir)
 	if err != nil {
 		return nil, err
 	}
-	sstIDs, err := sstableIDs(options.DataDir)
+	sstIDs, err := sstableIDs(tablesDir)
 	if err != nil {
 		return nil, err
 	}
@@ -102,14 +97,14 @@ func Open(options Options) (*DB, error) {
 		nextMemtableID: nextID,
 		options:        options,
 	}
-	db.flushStorage, err = storage.NewStorage(options.DataDir)
+	db.flushStorage, err = storage.NewStorage(tablesDir)
 	if err != nil {
 		return nil, err
 	}
 	db.flushCond = sync.NewCond(&db.mu)
 
 	for id := range sstIDs {
-		data, err := os.ReadFile(filepath.Join(options.DataDir, fmt.Sprintf("%06d.sst", id)))
+		data, err := os.ReadFile(filepath.Join(tablesDir, fmt.Sprintf("%06d.sst", id)))
 		if err != nil {
 			return nil, err
 		}
@@ -128,7 +123,7 @@ func Open(options Options) (*DB, error) {
 		if _, ok := sstIDs[id]; ok {
 			continue
 		}
-		path := walPath(options.WALDir, id)
+		path := walPath(walDir, id)
 		recovered, err := wal.Open(path)
 		if err != nil {
 			return nil, err
@@ -183,7 +178,7 @@ func (db *DB) newState(id uint64, existing *wal.WAL) (*memTableState, error) {
 	current := existing
 	if current == nil {
 		var err error
-		current, err = wal.Open(walPath(db.options.WALDir, id))
+		current, err = wal.Open(walPath(filepath.Join(db.options.DataDir, "wal"), id))
 		if err != nil {
 			return nil, err
 		}

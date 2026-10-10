@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"sync"
 	"testing"
 
@@ -34,8 +33,7 @@ func setupTestDB(t *testing.T) *engine.DB {
 	t.Helper()
 	dir := t.TempDir()
 	opts := engine.Options{
-		WALDir:          filepath.Join(dir, "wal"),
-		DataDir:         filepath.Join(dir, "tables"),
+		DataDir:         dir,
 		MemTableMaxSize: engine.DefaultMemTableMaxSize,
 		SyncMode:        engine.SyncModeSync,
 	}

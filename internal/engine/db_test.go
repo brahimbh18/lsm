@@ -13,8 +13,7 @@ import (
 
 func testOptions(directory string) Options {
 	return Options{
-		WALDir:          filepath.Join(directory, "wal"),
-		DataDir:         filepath.Join(directory, "tables"),
+		DataDir:         directory,
 		MemTableMaxSize: 10,
 	}
 }
@@ -109,7 +108,7 @@ func TestOpenCreatesDataDirectory(t *testing.T) {
 		t.Fatalf("expected %s to be a directory", dataPath)
 	}
 
-	walFile := filepath.Join(dataPath, "wal-000001.log")
+	walFile := filepath.Join(dataPath, "wal", "wal-000001.log")
 	walInfo, err := os.Stat(walFile)
 	if err != nil {
 		t.Fatalf("WAL file was not created: %v", err)
@@ -134,7 +133,7 @@ func TestOpenPreservesExistingData(t *testing.T) {
 		t.Fatalf("Put() error = %v", err)
 	}
 
-	walFile := filepath.Join(dir, "data", "wal-000001.log")
+	walFile := filepath.Join(dir, "data", "wal", "wal-000001.log")
 	walBefore, err := os.Stat(walFile)
 	if err != nil {
 		t.Fatalf("wal-000001.log does not exist: %v", err)

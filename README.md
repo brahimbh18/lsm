@@ -36,6 +36,15 @@ The project maintains a clean separation between the storage engine internals an
 - **HTTP Server**: A thin adapter translating incoming JSON HTTP requests into calls to its `server.Store` interface. The production implementation is `engine.DB`, but the adapter is not coupled to that concrete engine and does not contain storage logic or server-level mutexes.
 - **engine.DB**: Coordinates active and frozen MemTables, WAL logging, and background SSTable flushes.
 
+The engine accepts one database data directory and keeps its storage
+mechanisms separated beneath it:
+
+```text
+data/
+├── wal/
+└── tables/
+```
+
 ## Record formats
 
 Writes receive monotonically increasing sequence numbers from `engine.DB`. The WAL
@@ -60,7 +69,7 @@ go run ./cmd/lsm-server --addr :8080 --data-dir ./data
 
 Command-line flags:
 - `--addr`: HTTP listen address (default: `:8080`).
-- `--data-dir`: Base directory for WAL and SSTable storage (default: `./data`).
+- `--data-dir`: Database root directory; WALs and SSTables are stored in its `wal/` and `tables/` subdirectories (default: `./data`).
 
 At startup, the server prints:
 ```text

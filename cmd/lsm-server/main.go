@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -34,12 +33,8 @@ func main() {
 		}
 	}
 
-	walDir := envOrDefault("WAL_DIR", *dataDir)
-	tablesDir := envOrDefault("DATA_DIR", filepath.Join(*dataDir, "tables"))
-
 	db, err := engine.Open(engine.Options{
-		WALDir:      walDir,
-		DataDir:     tablesDir,
+		DataDir:     envOrDefault("DATA_DIR", *dataDir),
 		SyncMode:    engine.SyncModeSync,
 		DebugLogger: debugLogger,
 		DebugLevel:  debugLevel,

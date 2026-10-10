@@ -24,8 +24,7 @@ func TestLargeWorkload(t *testing.T) {
 	directory := t.TempDir()
 	debugLevel, _ := strconv.Atoi(os.Getenv("LSM_DEBUG"))
 	options := Options{
-		WALDir:          filepath.Join(directory, "wal"),
-		DataDir:         filepath.Join(directory, "tables"),
+		DataDir:         directory,
 		MemTableMaxSize: DefaultMemTableMaxSize,
 		DebugLogger:     testingLogger{t: t},
 		DebugLevel:      debugLevel,
@@ -65,14 +64,14 @@ func TestLargeWorkload(t *testing.T) {
 		t.Fatalf("L0 SSTables = %d, flushed MemTables = %d", stats.L0SSTablesCreated, stats.MemTablesFlushed)
 	}
 
-	files, err := filepath.Glob(filepath.Join(options.DataDir, "*.sst"))
+	files, err := filepath.Glob(filepath.Join(options.DataDir, "tables", "*.sst"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(files) != stats.L0SSTablesCreated {
 		t.Fatalf("SSTable files = %d, want %d", len(files), stats.L0SSTablesCreated)
 	}
-	walFiles, err := filepath.Glob(filepath.Join(options.WALDir, "wal-*.log"))
+	walFiles, err := filepath.Glob(filepath.Join(options.DataDir, "wal", "wal-*.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +97,7 @@ func TestLargeWorkload(t *testing.T) {
 	t.Logf("MemTables frozen:      %d", stats.MemTablesFrozen)
 	t.Logf("MemTables flushed:     %d", stats.MemTablesFlushed)
 	t.Logf("L0 SSTables created:   %d", stats.L0SSTablesCreated)
-	t.Logf("WAL bytes:             %d", directorySize(t, options.WALDir))
+	t.Logf("WAL bytes:             %d", directorySize(t, filepath.Join(options.DataDir, "wal")))
 	t.Logf("SSTable bytes:         %d", stats.SSTableBytes)
 	t.Logf("Total SSTable blocks:  %d", stats.TotalSSTableBlocks)
 	t.Logf("Write duration:        %s", writeDuration)
@@ -139,8 +138,7 @@ func TestLargeWorkload(t *testing.T) {
 func TestFlushFailureKeepsWAL(t *testing.T) {
 	directory := t.TempDir()
 	db, err := Open(Options{
-		WALDir:          filepath.Join(directory, "wal"),
-		DataDir:         filepath.Join(directory, "tables"),
+		DataDir:         directory,
 		MemTableMaxSize: 1,
 	})
 	if err != nil {
