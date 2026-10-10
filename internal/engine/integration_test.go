@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"lsm/internal/storage"
+	"lsm/internal/storage/sstable"
 )
 
 const (
@@ -163,7 +164,7 @@ func TestFlushFailureKeepsWAL(t *testing.T) {
 
 type failingStorage struct{}
 
-func (failingStorage) WriteWithInfo(*storage.SSTable) (storage.WriteResult, error) {
+func (failingStorage) WriteWithInfo(*sstable.SSTable) (storage.WriteResult, error) {
 	return storage.WriteResult{}, errors.New("injected SSTable write failure")
 }
 

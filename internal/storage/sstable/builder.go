@@ -1,4 +1,4 @@
-package storage
+package sstable
 
 import (
 	"encoding/binary"
@@ -174,4 +174,41 @@ func EncodeFooter(footer Footer) []byte {
 	binary.BigEndian.PutUint64(data[0:8], footer.IndexOffset)
 	binary.BigEndian.PutUint64(data[8:16], footer.IndexSize)
 	return data
+}
+
+// DecodeSSTable validates and decodes every record in an SSTable. The
+// returned entries retain the table's key order.
+func DecodeSSTable(data []byte) ([]memtable.Entry, error) {
+	if len(data) < 16 {
+		return nil, ErrMalformedRecord
+	}
+	footerStart := len(data) - 16
+	indexOffset := binary.BigEndian.Uint64(data[footerStart : footerStart+8])
+	indexSize := binary.BigEndian.Uint64(data[footerStart+8:])
+	if indexOffset > uint64(footerStart) || indexSize != uint64(footerStart)-indexOffset || indexSize%16 != 0 {
+		return nil, ErrMalformedRecord
+	}
+
+	entries := make([]memtable.Entry, 0)
+	for indexPos := indexOffset; indexPos < indexOffset+indexSize; indexPos += 16 {
+		indexEnd := indexPos + 16
+		if indexEnd > uint64(footerStart) {
+			return nil, ErrMalformedRecord
+		}
+		blockOffset := binary.BigEndian.Uint64(data[indexPos : indexPos+8])
+		blockSize := binary.BigEndian.Uint64(data[indexPos+8 : indexEnd])
+		if blockOffset > indexOffset || blockSize > indexOffset-blockOffset {
+			return nil, ErrMalformedRecord
+		}
+		blockEnd := blockOffset + blockSize
+		for recordPos := blockOffset; recordPos < blockEnd; {
+			entry, recordSize, err := DecodeRecord(data[recordPos:blockEnd])
+			if err != nil || recordSize <= 0 {
+				return nil, ErrMalformedRecord
+			}
+			entries = append(entries, entry)
+			recordPos += uint64(recordSize)
+		}
+	}
+	return entries, nil
 }

@@ -12,6 +12,7 @@ import (
 
 	"lsm/internal/memtable"
 	"lsm/internal/storage"
+	"lsm/internal/storage/sstable"
 	"lsm/internal/wal"
 )
 
@@ -29,7 +30,7 @@ type flushTask struct {
 }
 
 type sstableStorage interface {
-	WriteWithInfo(*storage.SSTable) (storage.WriteResult, error)
+	WriteWithInfo(*sstable.SSTable) (storage.WriteResult, error)
 }
 
 type FlushStats struct {
@@ -50,7 +51,7 @@ type DB struct {
 	frozenMemtables []*flushTask
 	flushQueue      chan *flushTask
 	flushWorker     sync.WaitGroup
-	flushBuilder    *storage.Builder
+	flushBuilder    *sstable.Builder
 	flushStorage    sstableStorage
 	flushDone       chan struct{}
 	flushErr        error
@@ -91,7 +92,7 @@ func Open(options Options) (*DB, error) {
 
 	db := &DB{
 		flushQueue:     make(chan *flushTask, 1),
-		flushBuilder:   storage.NewBuilder(),
+		flushBuilder:   sstable.NewBuilder(),
 		flushDone:      make(chan struct{}, 1),
 		flushStorage:   nil,
 		nextMemtableID: nextID,
@@ -108,7 +109,7 @@ func Open(options Options) (*DB, error) {
 		if err != nil {
 			return nil, err
 		}
-		sequence, err := storage.MaxSequence(data)
+		sequence, err := sstable.MaxSequence(data)
 		if err != nil {
 			return nil, fmt.Errorf("read SSTable %d: %w", id, err)
 		}
@@ -313,7 +314,7 @@ func (db *DB) Get(key []byte) ([]byte, bool) {
 func (db *DB) flush(task *flushTask) error {
 	start := time.Now()
 	db.log(1, "[FLUSH] START memtable=%d wal=%s", task.state.id, task.state.wal.Path())
-	blocks := storage.SplitBlocks(task.state.table.Entries())
+	blocks := sstable.SplitBlocks(task.state.table.Entries())
 	sstable, err := db.flushBuilder.Build(task.state.table)
 	if err != nil {
 		return err

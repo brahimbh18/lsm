@@ -62,6 +62,27 @@ reserved-length keys.
 
 ---
 
+## Compaction policy
+
+Memtables default to 16 MiB. A flush creates one L0 SSTable whose exact size
+depends on key/value lengths and SSTable metadata. Compaction uses on-disk
+bytes rather than file count as the level-pressure metric:
+
+- L0 compaction starts at 64 MiB or four files, whichever comes first.
+- L1 targets 640 MiB.
+- Each following level targets 10 times the previous level.
+- L0 uses a file-count trigger because L0 files can overlap and increase read
+  amplification; higher levels use byte pressure only.
+
+The thresholds are represented by `storage/compaction.CompactionPolicy`. The
+`storage/sstable` package provides SSTable encoding and decoding, while
+`storage/compaction` provides overlap selection and `CompactSSTables`, which
+merges tables by sequence number while retaining tombstones. Durable level
+metadata and background scheduling remain engine integration work; inputs
+should only be deleted after a manifest update is made durable.
+
+---
+
 ## Starting the Server
 
 Build and start the server using `cmd/lsm-server`:

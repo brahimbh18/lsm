@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"lsm/internal/storage/sstable"
 )
 
 type Storage struct {
@@ -34,12 +36,12 @@ func NewStorage(directory string) (*Storage, error) {
 	return &Storage{directory: directory, nextID: nextID}, nil
 }
 
-func (s *Storage) Write(table *SSTable) error {
+func (s *Storage) Write(table *sstable.SSTable) error {
 	_, err := s.WriteWithInfo(table)
 	return err
 }
 
-func (s *Storage) WriteWithInfo(table *SSTable) (WriteResult, error) {
+func (s *Storage) WriteWithInfo(table *sstable.SSTable) (WriteResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

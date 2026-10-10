@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"lsm/internal/storage/sstable"
 )
 
 func TestStorageWritePersistsSSTableBytes(t *testing.T) {
@@ -14,8 +16,8 @@ func TestStorageWritePersistsSSTableBytes(t *testing.T) {
 		t.Fatalf("NewStorage() error = %v", err)
 	}
 
-	first := &SSTable{Data: []byte("first table")}
-	second := &SSTable{Data: []byte("second table")}
+	first := &sstable.SSTable{Data: []byte("first table")}
+	second := &sstable.SSTable{Data: []byte("second table")}
 	if err := storage.Write(first); err != nil {
 		t.Fatalf("first Write() error = %v", err)
 	}
@@ -46,7 +48,7 @@ func TestStorageContinuesSequenceAcrossOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first NewStorage() error = %v", err)
 	}
-	if err := firstStorage.Write(&SSTable{Data: []byte("first")}); err != nil {
+	if err := firstStorage.Write(&sstable.SSTable{Data: []byte("first")}); err != nil {
 		t.Fatalf("first Write() error = %v", err)
 	}
 
@@ -54,7 +56,7 @@ func TestStorageContinuesSequenceAcrossOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second NewStorage() error = %v", err)
 	}
-	if err := secondStorage.Write(&SSTable{Data: []byte("second")}); err != nil {
+	if err := secondStorage.Write(&sstable.SSTable{Data: []byte("second")}); err != nil {
 		t.Fatalf("second Write() error = %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(directory, "000002.sst")); err != nil {
