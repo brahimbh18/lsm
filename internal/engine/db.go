@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -378,10 +379,11 @@ func (db *DB) write(key, value []byte, tombstone bool) error {
 }
 
 func (db *DB) Get(key []byte) ([]byte, bool) {
+	db.manifestMu.Lock()
+	defer db.manifestMu.Unlock()
 	db.mu.RLock()
-	defer db.mu.RUnlock()
-
 	if entry, ok := db.active.table.Lookup(key); ok {
+		db.mu.RUnlock()
 		if entry.Tombstone {
 			return nil, false
 		}
@@ -389,11 +391,45 @@ func (db *DB) Get(key []byte) ([]byte, bool) {
 	}
 	for index := len(db.frozenMemtables) - 1; index >= 0; index-- {
 		if entry, ok := db.frozenMemtables[index].state.table.Lookup(key); ok {
+			db.mu.RUnlock()
 			if entry.Tombstone {
 				return nil, false
 			}
 			return entry.Value, true
 		}
+	}
+	tables := append([]storage.TableMeta(nil), db.manifest.Tables...)
+	db.mu.RUnlock()
+
+	var newest memtable.Entry
+	found := false
+	tableStore, ok := db.flushStorage.(compactableStorage)
+	if !ok {
+		return nil, false
+	}
+	for _, meta := range tables {
+		if len(meta.Smallest) > 0 && (bytes.Compare(key, meta.Smallest) < 0 || bytes.Compare(key, meta.Largest) > 0) {
+			continue
+		}
+		table, err := tableStore.Read(meta.ID)
+		if err != nil {
+			db.log(1, "[GET] READ table=%06d error=%v", meta.ID, err)
+			continue
+		}
+		entries, err := sstable.DecodeSSTable(table.Data)
+		if err != nil {
+			db.log(1, "[GET] DECODE table=%06d error=%v", meta.ID, err)
+			continue
+		}
+		for _, entry := range entries {
+			if bytes.Equal(entry.Key, key) && (!found || entry.Seq > newest.Seq) {
+				newest = entry
+				found = true
+			}
+		}
+	}
+	if found && !newest.Tombstone {
+		return newest.Value, true
 	}
 	return nil, false
 }

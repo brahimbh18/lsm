@@ -234,6 +234,7 @@ func TestRecoveryContinuesSequenceAfterFlush(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if err := db.Put([]byte("first"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
@@ -260,6 +261,35 @@ func TestRecoveryContinuesSequenceAfterFlush(t *testing.T) {
 	}
 	if entries := db.active.table.Entries(); len(entries) != 1 || entries[0].Seq != 2 {
 		t.Fatalf("recovered active entries = %+v", entries)
+	}
+}
+
+func TestGetReadsPersistedSSTablesAfterReopen(t *testing.T) {
+	directory := t.TempDir()
+	options := testOptions(directory)
+	options.MemTableMaxSize = 1
+	db, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("persisted"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WaitForFlushes(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	got, ok := db.Get([]byte("persisted"))
+	if !ok || !bytes.Equal(got, []byte("value")) {
+		t.Fatalf("persisted Get() = %q, found=%v", got, ok)
 	}
 }
 
