@@ -19,6 +19,7 @@ type Storage struct {
 }
 
 type WriteResult struct {
+	ID   uint64
 	Path string
 	Size int64
 }
@@ -68,8 +69,21 @@ func (s *Storage) WriteWithInfo(table *sstable.SSTable) (WriteResult, error) {
 		return WriteResult{}, err
 	}
 
+	id := s.nextID
 	s.nextID++
-	return WriteResult{Path: path, Size: int64(len(table.Data))}, nil
+	return WriteResult{ID: id, Path: path, Size: int64(len(table.Data))}, nil
+}
+
+func (s *Storage) Read(id uint64) (*sstable.SSTable, error) {
+	data, err := os.ReadFile(filepath.Join(s.directory, fmt.Sprintf("%06d.sst", id)))
+	if err != nil {
+		return nil, err
+	}
+	return &sstable.SSTable{Data: data}, nil
+}
+
+func (s *Storage) Delete(id uint64) error {
+	return os.Remove(filepath.Join(s.directory, fmt.Sprintf("%06d.sst", id)))
 }
 
 func nextTableID(directory string) (uint64, error) {

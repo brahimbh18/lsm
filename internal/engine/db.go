@@ -12,6 +12,7 @@ import (
 
 	"lsm/internal/memtable"
 	"lsm/internal/storage"
+	"lsm/internal/storage/compaction"
 	"lsm/internal/storage/sstable"
 	"lsm/internal/wal"
 )
@@ -33,6 +34,12 @@ type sstableStorage interface {
 	WriteWithInfo(*sstable.SSTable) (storage.WriteResult, error)
 }
 
+type compactableStorage interface {
+	sstableStorage
+	Read(uint64) (*sstable.SSTable, error)
+	Delete(uint64) error
+}
+
 type FlushStats struct {
 	RecordsWritten     int
 	BytesWritten       int64
@@ -45,23 +52,29 @@ type FlushStats struct {
 }
 
 type DB struct {
-	mu              sync.RWMutex
-	queueMu         sync.Mutex
-	active          *memTableState
-	frozenMemtables []*flushTask
-	flushQueue      chan *flushTask
-	flushWorker     sync.WaitGroup
-	flushBuilder    *sstable.Builder
-	flushStorage    sstableStorage
-	flushDone       chan struct{}
-	flushErr        error
-	flushCond       *sync.Cond
-	nextMemtableID  uint64
-	stats           FlushStats
-	options         Options
-	closed          bool
-	lastSequence    uint64
-	flushPending    int
+	mu               sync.RWMutex
+	manifestMu       sync.Mutex
+	queueMu          sync.Mutex
+	active           *memTableState
+	frozenMemtables  []*flushTask
+	flushQueue       chan *flushTask
+	flushWorker      sync.WaitGroup
+	compactionQueue  chan struct{}
+	compactionWorker sync.WaitGroup
+	flushBuilder     *sstable.Builder
+	flushStorage     sstableStorage
+	flushDone        chan struct{}
+	flushErr         error
+	flushCond        *sync.Cond
+	nextMemtableID   uint64
+	manifest         storage.Manifest
+	tablesDir        string
+	compaction       compaction.CompactionPolicy
+	stats            FlushStats
+	options          Options
+	closed           bool
+	lastSequence     uint64
+	flushPending     int
 }
 
 func Open(options Options) (*DB, error) {
@@ -72,6 +85,9 @@ func Open(options Options) (*DB, error) {
 	tablesDir := filepath.Join(options.DataDir, "tables")
 	if options.MemTableMaxSize <= 0 {
 		options.MemTableMaxSize = DefaultMemTableMaxSize
+	}
+	if options.CompactionPolicy == (compaction.CompactionPolicy{}) {
+		options.CompactionPolicy = compaction.DefaultCompactionPolicy()
 	}
 
 	if err := os.MkdirAll(walDir, 0755); err != nil {
@@ -91,16 +107,39 @@ func Open(options Options) (*DB, error) {
 	nextID := maxID(walIDs, mapIDs(sstIDs)) + 1
 
 	db := &DB{
-		flushQueue:     make(chan *flushTask, 1),
-		flushBuilder:   sstable.NewBuilder(),
-		flushDone:      make(chan struct{}, 1),
-		flushStorage:   nil,
-		nextMemtableID: nextID,
-		options:        options,
+		flushQueue:      make(chan *flushTask, 1),
+		compactionQueue: make(chan struct{}, 1),
+		flushBuilder:    sstable.NewBuilder(),
+		flushDone:       make(chan struct{}, 1),
+		flushStorage:    nil,
+		nextMemtableID:  nextID,
+		options:         options,
+		tablesDir:       tablesDir,
+		compaction:      options.CompactionPolicy,
 	}
 	db.flushStorage, err = storage.NewStorage(tablesDir)
 	if err != nil {
 		return nil, err
+	}
+	db.manifest, err = storage.ReadManifest(tablesDir)
+	if err != nil {
+		return nil, err
+	}
+	if len(db.manifest.Tables) == 0 && len(sstIDs) > 0 {
+		for id := range sstIDs {
+			table, readErr := db.flushStorage.(*storage.Storage).Read(id)
+			if readErr != nil {
+				return nil, readErr
+			}
+			meta, metaErr := tableMeta(id, 0, table)
+			if metaErr != nil {
+				return nil, metaErr
+			}
+			db.manifest.Tables = append(db.manifest.Tables, meta)
+		}
+		if err := storage.WriteManifest(tablesDir, db.manifest); err != nil {
+			return nil, err
+		}
 	}
 	db.flushCond = sync.NewCond(&db.mu)
 
@@ -172,6 +211,7 @@ func Open(options Options) (*DB, error) {
 	db.log(1, "[WAL] CREATE path=%s", db.active.wal.Path())
 	db.log(1, "[MEMTABLE] CREATE id=%d wal=%s", db.active.id, db.active.wal.Path())
 	db.startFlushWorker()
+	db.startCompactionWorker()
 	return db, nil
 }
 
@@ -208,6 +248,9 @@ func (db *DB) startFlushWorker() {
 				db.stats.L0SSTablesCreated++
 			}
 			db.flushPending--
+			if err == nil {
+				db.requestCompactionLocked()
+			}
 			db.flushCond.Broadcast()
 			db.mu.Unlock()
 			select {
@@ -216,6 +259,50 @@ func (db *DB) startFlushWorker() {
 			}
 		}
 	}()
+}
+
+func (db *DB) startCompactionWorker() {
+	db.compactionWorker.Add(1)
+	go func() {
+		defer db.compactionWorker.Done()
+		for range db.compactionQueue {
+			for {
+				compacted, err := db.compactOneTriggeredLevel()
+				if err != nil {
+					db.mu.Lock()
+					if db.flushErr == nil {
+						db.flushErr = err
+					}
+					db.mu.Unlock()
+					break
+				}
+				if !compacted {
+					break
+				}
+			}
+			db.mu.Lock()
+			db.flushPending--
+			db.flushCond.Broadcast()
+			db.mu.Unlock()
+		}
+	}()
+}
+
+func (db *DB) requestCompaction() {
+	db.mu.Lock()
+	db.requestCompactionLocked()
+	db.mu.Unlock()
+}
+
+func (db *DB) requestCompactionLocked() {
+	if db.closed {
+		return
+	}
+	select {
+	case db.compactionQueue <- struct{}{}:
+		db.flushPending++
+	default:
+	}
 }
 
 func (db *DB) Put(key, value []byte) error {
@@ -324,6 +411,19 @@ func (db *DB) flush(task *flushTask) error {
 	if err != nil {
 		return err
 	}
+	meta, err := tableMeta(result.ID, 0, sstable)
+	if err != nil {
+		return err
+	}
+	db.manifestMu.Lock()
+	defer db.manifestMu.Unlock()
+	db.mu.Lock()
+	db.manifest.Tables = append(db.manifest.Tables, meta)
+	manifest := db.manifest
+	db.mu.Unlock()
+	if err := storage.WriteManifest(db.tablesDir, manifest); err != nil {
+		return err
+	}
 	if err := task.state.wal.Close(); err != nil {
 		return err
 	}
@@ -364,6 +464,123 @@ func (db *DB) FlushStats() FlushStats {
 	return db.stats
 }
 
+func (db *DB) compactOneTriggeredLevel() (bool, error) {
+	tableStore, ok := db.flushStorage.(compactableStorage)
+	if !ok {
+		return false, nil
+	}
+
+	db.manifestMu.Lock()
+	defer db.manifestMu.Unlock()
+	db.mu.RLock()
+	tables := append([]storage.TableMeta(nil), db.manifest.Tables...)
+	db.mu.RUnlock()
+	level := -1
+	maxLevel := 0
+	for _, table := range tables {
+		if table.Level > maxLevel {
+			maxLevel = table.Level
+		}
+	}
+	for candidate := 0; candidate <= maxLevel; candidate++ {
+		var bytes uint64
+		var count int
+		for _, table := range tables {
+			if table.Level == candidate {
+				bytes += table.Size
+				count++
+			}
+		}
+		triggered, err := db.compaction.ShouldCompact(candidate, bytes, count)
+		if err != nil {
+			return false, err
+		}
+		if triggered {
+			level = candidate
+			break
+		}
+	}
+	if level < 0 {
+		return false, nil
+	}
+
+	source := make([]compaction.SSTableMeta, 0)
+	next := make([]compaction.SSTableMeta, 0)
+	for _, table := range tables {
+		meta := compaction.SSTableMeta{
+			ID: table.ID, Level: table.Level, Size: table.Size,
+			Smallest: table.Smallest, Largest: table.Largest,
+		}
+		if table.Level == level {
+			source = append(source, meta)
+		} else if table.Level == level+1 {
+			next = append(next, meta)
+		}
+	}
+	selected, overlapping := compaction.SelectCompaction(level, source, next)
+	inputs := append(append([]compaction.SSTableMeta(nil), selected...), overlapping...)
+	if len(inputs) == 0 {
+		return false, nil
+	}
+	tablesToMerge := make([]*sstable.SSTable, 0, len(inputs))
+	for _, input := range inputs {
+		table, err := tableStore.Read(input.ID)
+		if err != nil {
+			return false, err
+		}
+		tablesToMerge = append(tablesToMerge, table)
+	}
+	merged, err := compaction.CompactSSTables(tablesToMerge...)
+	if err != nil {
+		return false, err
+	}
+	result, err := tableStore.WriteWithInfo(merged)
+	if err != nil {
+		return false, err
+	}
+	mergedMeta, err := tableMeta(result.ID, level+1, merged)
+	if err != nil {
+		return false, err
+	}
+	updated := storage.Manifest{Tables: make([]storage.TableMeta, 0, len(tables)-len(inputs)+1)}
+	inputIDs := make(map[uint64]struct{}, len(inputs))
+	for _, input := range inputs {
+		inputIDs[input.ID] = struct{}{}
+	}
+	for _, table := range tables {
+		if _, remove := inputIDs[table.ID]; !remove {
+			updated.Tables = append(updated.Tables, table)
+		}
+	}
+	updated.Tables = append(updated.Tables, mergedMeta)
+	if err := storage.WriteManifest(db.tablesDir, updated); err != nil {
+		return false, err
+	}
+	db.mu.Lock()
+	db.manifest = updated
+	db.mu.Unlock()
+	for _, input := range inputs {
+		if err := tableStore.Delete(input.ID); err != nil {
+			return false, err
+		}
+	}
+	db.log(1, "[COMPACTION] level=L%d inputs=%d output=%06d.sst", level, len(inputs), result.ID)
+	return true, nil
+}
+
+func tableMeta(id uint64, level int, table *sstable.SSTable) (storage.TableMeta, error) {
+	entries, err := sstable.DecodeSSTable(table.Data)
+	if err != nil {
+		return storage.TableMeta{}, err
+	}
+	meta := storage.TableMeta{ID: id, Level: level, Size: uint64(len(table.Data))}
+	if len(entries) > 0 {
+		meta.Smallest = append([]byte(nil), entries[0].Key...)
+		meta.Largest = append([]byte(nil), entries[len(entries)-1].Key...)
+	}
+	return meta, nil
+}
+
 func (db *DB) Close() error {
 	db.queueMu.Lock()
 	defer db.queueMu.Unlock()
@@ -376,6 +593,8 @@ func (db *DB) Close() error {
 	close(db.flushQueue)
 	db.mu.Unlock()
 	db.flushWorker.Wait()
+	close(db.compactionQueue)
+	db.compactionWorker.Wait()
 	db.mu.Lock()
 	flushErr := db.flushErr
 	activeErr := error(nil)

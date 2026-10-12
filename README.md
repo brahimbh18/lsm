@@ -75,11 +75,16 @@ bytes rather than file count as the level-pressure metric:
   amplification; higher levels use byte pressure only.
 
 The thresholds are represented by `storage/compaction.CompactionPolicy`. The
+engine triggers automatic L0 compaction from accumulated bytes or four files,
+whichever comes first. The
 `storage/sstable` package provides SSTable encoding and decoding, while
 `storage/compaction` provides overlap selection and `CompactSSTables`, which
-merges tables by sequence number while retaining tombstones. Durable level
-metadata and background scheduling remain engine integration work; inputs
-should only be deleted after a manifest update is made durable.
+merges tables by sequence number while retaining tombstones. Level membership
+and ranges are persisted in the table manifest. Compaction runs as independent
+bounded passes: an L0 pass can promote to L1, and later passes can promote L1
+to L2 and so on. A dedicated serialized compaction worker continuously rescans
+level pressure after each pass, without recursively loading all levels into one
+operation. Input files are removed only after the manifest update is durable.
 
 ---
 
@@ -104,7 +109,8 @@ data directory: ./data
 The server cleanly shuts down on `SIGINT` (Ctrl+C) and `SIGTERM`:
 1. Ceases accepting new HTTP requests.
 2. Gracefully finishes in-flight requests.
-3. Closes `engine.DB` and drains background flush workers before process exit.
+3. Closes `engine.DB` and drains background flush and compaction workers before
+   process exit.
 
 ---
 

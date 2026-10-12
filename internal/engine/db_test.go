@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"lsm/internal/memtable"
+	"lsm/internal/storage"
+	"lsm/internal/storage/compaction"
 )
 
 func testOptions(directory string) Options {
@@ -272,6 +274,56 @@ func TestSequenceOverflow(t *testing.T) {
 	db.mu.Unlock()
 	if err := db.Put([]byte("key"), []byte("value")); err != ErrSequenceOverflow {
 		t.Fatalf("Put() error = %v, want %v", err, ErrSequenceOverflow)
+	}
+}
+
+func TestCompactionRunsOneLevelPerFlush(t *testing.T) {
+	directory := t.TempDir()
+	db, err := Open(Options{
+		DataDir:         directory,
+		MemTableMaxSize: 1,
+		CompactionPolicy: compaction.CompactionPolicy{
+			L0TargetBytes:   1,
+			L0FileTrigger:   100,
+			LevelMultiplier: 100,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("first"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WaitForFlushes(); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := storage.ReadManifest(filepath.Join(directory, "tables"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Tables) != 1 || manifest.Tables[0].Level != 1 {
+		t.Fatalf("after first pass manifest = %+v, want one L1 table", manifest.Tables)
+	}
+
+	if err := db.Put([]byte("second"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WaitForFlushes(); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err = storage.ReadManifest(filepath.Join(directory, "tables"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	levels := make(map[int]int)
+	for _, table := range manifest.Tables {
+		levels[table.Level]++
+	}
+	if levels[1] != 1 || levels[2] != 1 {
+		t.Fatalf("after worker higher-level pass manifest = %+v, want one L1 and one L2 table", manifest.Tables)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
