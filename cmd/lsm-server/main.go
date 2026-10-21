@@ -1,86 +1,62 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"flag"
-	"fmt"
 	"log"
-	"net/http"
+	"net"
 	"os"
 	"os/signal"
 	"strconv"
 	"syscall"
-	"time"
 
 	"lsm/internal/engine"
 	"lsm/internal/server"
 )
 
 func main() {
-	var (
-		addr    = flag.String("addr", ":8080", "HTTP server listen address")
-		dataDir = flag.String("data-dir", "./data", "database data directory")
-	)
+	addr := flag.String("addr", ":6380", "RESP2 server listen address")
+	dataDir := flag.String("data-dir", "./data", "database data directory")
 	flag.Parse()
 
 	var debugLogger engine.DebugLogger
 	var debugLevel int
-	if val := os.Getenv("LSM_DEBUG"); val != "" {
-		if lvl, err := strconv.Atoi(val); err == nil && lvl > 0 {
-			debugLogger = log.Default()
-			debugLevel = lvl
+	if value := os.Getenv("LSM_DEBUG"); value != "" {
+		if level, err := strconv.Atoi(value); err == nil && level > 0 {
+			debugLogger, debugLevel = log.Default(), level
 		}
 	}
 
 	db, err := engine.Open(engine.Options{
-		DataDir:     envOrDefault("DATA_DIR", *dataDir),
-		SyncMode:    engine.SyncModeSync,
-		DebugLogger: debugLogger,
-		DebugLevel:  debugLevel,
+		DataDir:  envOrDefault("DATA_DIR", *dataDir),
+		SyncMode: engine.SyncModeSync, DebugLogger: debugLogger, DebugLevel: debugLevel,
 	})
 	if err != nil {
 		log.Fatalf("failed to open database: %v", err)
 	}
-
-	var serverOpts []server.Option
-	if debugLogger != nil {
-		serverOpts = append(serverOpts, server.WithDebug(debugLogger, debugLevel))
-	}
-	srv := server.New(db, serverOpts...)
-
-	httpServer := &http.Server{
-		Addr:    *addr,
-		Handler: srv,
-	}
-
-	shutdownDone := make(chan struct{})
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		if err := httpServer.Shutdown(ctx); err != nil {
-			log.Printf("HTTP shutdown error: %v", err)
+	defer func() {
+		if err := db.Close(); err != nil {
+			log.Printf("error closing database: %v", err)
 		}
-		close(shutdownDone)
 	}()
 
-	fmt.Printf("LSM server listening on %s\n", *addr)
-	fmt.Printf("data directory: %s\n", *dataDir)
-
-	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("server error: %v", err)
+	listener, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatalf("failed to listen on %s: %v", *addr, err)
 	}
+	srv := server.New(db, server.DefaultConfig)
 
-	<-shutdownDone
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-shutdown
+		_ = listener.Close()
+	}()
 
-	if err := db.Close(); err != nil {
-		log.Fatalf("error closing database: %v", err)
+	log.Printf("LSM RESP2 server listening on %s", *addr)
+	log.Printf("data directory: %s", envOrDefault("DATA_DIR", *dataDir))
+	if err := srv.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) {
+		log.Fatalf("server error: %v", err)
 	}
 }
 

@@ -1,455 +1,93 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
-	"encoding/json"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
-	"sync"
+	"net"
 	"testing"
+	"time"
 
 	"lsm/internal/engine"
+	"lsm/internal/protocol"
 )
 
-type fakeStore struct {
-	values    map[string][]byte
-	deleteErr error
-}
-
-func (s *fakeStore) Put(key, value []byte) error {
-	if s.values == nil {
-		s.values = make(map[string][]byte)
-	}
-	s.values[string(key)] = bytes.Clone(value)
-	return nil
-}
-
-func (s *fakeStore) Get(key []byte) ([]byte, bool) {
-	value, ok := s.values[string(key)]
-	return bytes.Clone(value), ok
-}
-
-func (s *fakeStore) Delete(key []byte) error {
-	if s.deleteErr != nil {
-		return s.deleteErr
-	}
-	delete(s.values, string(key))
-	return nil
-}
-
-func setupTestDB(t *testing.T) *engine.DB {
+func startTestServer(t *testing.T) (net.Listener, *engine.DB) {
 	t.Helper()
-	dir := t.TempDir()
-	opts := engine.Options{
-		DataDir:         dir,
-		MemTableMaxSize: engine.DefaultMemTableMaxSize,
-		SyncMode:        engine.SyncModeSync,
-	}
-	db, err := engine.Open(opts)
+	db, err := engine.Open(engine.Options{DataDir: t.TempDir(), SyncMode: engine.SyncModeSync})
 	if err != nil {
-		t.Fatalf("failed to open engine: %v", err)
+		t.Fatal(err)
 	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	go func() { _ = New(db, Config{IdleTimeout: time.Second}).Serve(listener) }()
 	t.Cleanup(func() {
+		_ = listener.Close()
 		_ = db.Close()
 	})
-	return db
+	return listener, db
 }
 
-func TestServerUsesStoreBoundary(t *testing.T) {
-	store := &fakeStore{}
-	srv := New(store)
-
-	putReq := httptest.NewRequest(http.MethodPut, "/kv/foo", bytes.NewBufferString(`{"value":"bar"}`))
-	putRec := httptest.NewRecorder()
-	srv.ServeHTTP(putRec, putReq)
-	if putRec.Code != http.StatusOK {
-		t.Fatalf("PUT status = %d, want %d", putRec.Code, http.StatusOK)
+func command(name string, args ...string) []byte {
+	var out []byte
+	out = append(out, '*')
+	out = append(out, '0'+byte(len(args)+1), '\r', '\n')
+	out = protocol.Bulk(out, []byte(name))
+	for _, arg := range args {
+		out = protocol.Bulk(out, []byte(arg))
 	}
-
-	getReq := httptest.NewRequest(http.MethodGet, "/kv/foo", nil)
-	getRec := httptest.NewRecorder()
-	srv.ServeHTTP(getRec, getReq)
-	if getRec.Code != http.StatusOK {
-		t.Fatalf("GET status = %d, want %d", getRec.Code, http.StatusOK)
-	}
-
-	var response getResponse
-	if err := json.Unmarshal(getRec.Body.Bytes(), &response); err != nil {
-		t.Fatalf("decode GET response: %v", err)
-	}
-	if response.Value != "bar" {
-		t.Fatalf("GET value = %q, want %q", response.Value, "bar")
-	}
+	return out
 }
 
-func TestHealth(t *testing.T) {
-	db := setupTestDB(t)
-	srv := New(db)
+func TestRESPCommandsAndPipeline(t *testing.T) {
+	listener, _ := startTestServer(t)
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
 
-	req := httptest.NewRequest(http.MethodGet, "/health", nil)
-	rec := httptest.NewRecorder()
-
-	srv.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d", rec.Code)
+	var input []byte
+	input = append(input, command("SET", "foo", "bar")...)
+	input = append(input, command("GET", "foo")...)
+	input = append(input, command("GET", "missing")...)
+	input = append(input, command("DEL", "foo", "missing")...)
+	if _, err := conn.Write(input); err != nil {
+		t.Fatal(err)
 	}
 
-	var resp healthResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to parse JSON response: %v", err)
-	}
-	if resp.Status != "ok" {
-		t.Fatalf("expected status 'ok', got %q", resp.Status)
-	}
-}
-
-func TestPut(t *testing.T) {
-	db := setupTestDB(t)
-	srv := New(db)
-
-	body := []byte(`{"value":"hello"}`)
-	req := httptest.NewRequest(http.MethodPut, "/kv/foo", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-
-	srv.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d (body: %s)", rec.Code, rec.Body.String())
-	}
-
-	var resp putResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to parse JSON response: %v", err)
-	}
-	if resp.Key != "foo" {
-		t.Fatalf("expected key 'foo', got %q", resp.Key)
-	}
-	if resp.Status != "ok" {
-		t.Fatalf("expected status 'ok', got %q", resp.Status)
-	}
-}
-
-func TestPutAndGet(t *testing.T) {
-	db := setupTestDB(t)
-	srv := New(db)
-
-	// PUT /kv/foo
-	putBody := []byte(`{"value":"hello"}`)
-	putReq := httptest.NewRequest(http.MethodPut, "/kv/foo", bytes.NewReader(putBody))
-	putReq.Header.Set("Content-Type", "application/json")
-	putRec := httptest.NewRecorder()
-
-	srv.ServeHTTP(putRec, putReq)
-	if putRec.Code != http.StatusOK {
-		t.Fatalf("PUT /kv/foo failed with status %d: %s", putRec.Code, putRec.Body.String())
-	}
-
-	// GET /kv/foo
-	getReq := httptest.NewRequest(http.MethodGet, "/kv/foo", nil)
-	getRec := httptest.NewRecorder()
-
-	srv.ServeHTTP(getRec, getReq)
-	if getRec.Code != http.StatusOK {
-		t.Fatalf("GET /kv/foo failed with status %d: %s", getRec.Code, getRec.Body.String())
-	}
-
-	var resp getResponse
-	if err := json.Unmarshal(getRec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to parse GET response: %v", err)
-	}
-	if resp.Key != "foo" {
-		t.Fatalf("expected key 'foo', got %q", resp.Key)
-	}
-	if resp.Value != "hello" {
-		t.Fatalf("expected value 'hello', got %q", resp.Value)
-	}
-}
-
-func TestDelete(t *testing.T) {
-	db := setupTestDB(t)
-	srv := New(db)
-
-	putReq := httptest.NewRequest(http.MethodPut, "/kv/foo", bytes.NewBufferString(`{"value":"hello"}`))
-	putRec := httptest.NewRecorder()
-	srv.ServeHTTP(putRec, putReq)
-	if putRec.Code != http.StatusOK {
-		t.Fatalf("PUT status = %d, want %d", putRec.Code, http.StatusOK)
-	}
-
-	deleteReq := httptest.NewRequest(http.MethodDelete, "/kv/foo", nil)
-	deleteRec := httptest.NewRecorder()
-	srv.ServeHTTP(deleteRec, deleteReq)
-	if deleteRec.Code != http.StatusOK {
-		t.Fatalf("DELETE status = %d, want %d: %s", deleteRec.Code, http.StatusOK, deleteRec.Body.String())
-	}
-
-	var response deleteResponse
-	if err := json.Unmarshal(deleteRec.Body.Bytes(), &response); err != nil {
-		t.Fatalf("decode DELETE response: %v", err)
-	}
-	if response.Key != "foo" || response.Status != "deleted" {
-		t.Fatalf("DELETE response = %#v, want key foo and status deleted", response)
-	}
-
-	getReq := httptest.NewRequest(http.MethodGet, "/kv/foo", nil)
-	getRec := httptest.NewRecorder()
-	srv.ServeHTTP(getRec, getReq)
-	if getRec.Code != http.StatusNotFound {
-		t.Fatalf("GET after DELETE status = %d, want %d", getRec.Code, http.StatusNotFound)
-	}
-}
-
-func TestDeleteMissingKeySucceeds(t *testing.T) {
-	srv := New(&fakeStore{})
-	req := httptest.NewRequest(http.MethodDelete, "/kv/missing", nil)
-	rec := httptest.NewRecorder()
-
-	srv.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("DELETE missing key status = %d, want %d", rec.Code, http.StatusOK)
-	}
-}
-
-func TestMissingKey(t *testing.T) {
-	db := setupTestDB(t)
-	srv := New(db)
-
-	req := httptest.NewRequest(http.MethodGet, "/kv/does-not-exist", nil)
-	rec := httptest.NewRecorder()
-
-	srv.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("expected status 404, got %d", rec.Code)
-	}
-
-	var resp errorResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to parse JSON response: %v", err)
-	}
-	if resp.Error != "key not found" {
-		t.Fatalf("expected error 'key not found', got %q", resp.Error)
-	}
-}
-
-func TestMultipleKeys(t *testing.T) {
-	db := setupTestDB(t)
-	srv := New(db)
-
-	entries := []struct {
-		key   string
-		value string
-	}{
-		{"foo", "hello"},
-		{"bar", "world"},
-		{"baz", "test"},
-	}
-
-	// PUT all keys
-	for _, entry := range entries {
-		body := []byte(fmt.Sprintf(`{"value":%q}`, entry.value))
-		req := httptest.NewRequest(http.MethodPut, "/kv/"+entry.key, bytes.NewReader(body))
-		rec := httptest.NewRecorder()
-		srv.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("PUT /kv/%s failed with %d: %s", entry.key, rec.Code, rec.Body.String())
+	reader := bufio.NewReader(conn)
+	for _, want := range []string{"+OK\r\n", "$3\r\n", "bar\r\n", "$-1\r\n", ":1\r\n"} {
+		got, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
 		}
-	}
-
-	// GET each key and verify they remain independent
-	for _, entry := range entries {
-		req := httptest.NewRequest(http.MethodGet, "/kv/"+entry.key, nil)
-		rec := httptest.NewRecorder()
-		srv.ServeHTTP(rec, req)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("GET /kv/%s failed with %d: %s", entry.key, rec.Code, rec.Body.String())
-		}
-
-		var resp getResponse
-		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("failed to decode response for %s: %v", entry.key, err)
-		}
-		if resp.Key != entry.key {
-			t.Fatalf("expected key %q, got %q", entry.key, resp.Key)
-		}
-		if resp.Value != entry.value {
-			t.Fatalf("expected value %q, got %q", entry.value, resp.Value)
+		if got != want {
+			t.Fatalf("reply = %q, want %q", got, want)
 		}
 	}
 }
 
-func TestErrorHandling_MalformedRequests(t *testing.T) {
-	db := setupTestDB(t)
-	srv := New(db)
-
-	tests := []struct {
-		name       string
-		method     string
-		path       string
-		body       string
-		wantStatus int
-	}{
-		{
-			name:       "invalid JSON syntax",
-			method:     http.MethodPut,
-			path:       "/kv/foo",
-			body:       `{invalid json`,
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name:       "empty request body",
-			method:     http.MethodPut,
-			path:       "/kv/foo",
-			body:       "",
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name:       "missing value field",
-			method:     http.MethodPut,
-			path:       "/kv/foo",
-			body:       `{}`,
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name:       "non-string value field",
-			method:     http.MethodPut,
-			path:       "/kv/foo",
-			body:       `{"value":123}`,
-			wantStatus: http.StatusBadRequest,
-		},
+func TestProtocolErrorClosesConnection(t *testing.T) {
+	listener, _ := startTestServer(t)
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(tc.method, tc.path, bytes.NewBufferString(tc.body))
-			rec := httptest.NewRecorder()
-			srv.ServeHTTP(rec, req)
-
-			if rec.Code != tc.wantStatus {
-				t.Fatalf("expected status %d, got %d (body: %s)", tc.wantStatus, rec.Code, rec.Body.String())
-			}
-
-			var resp errorResponse
-			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-				t.Fatalf("response is not valid error JSON: %v", err)
-			}
-			if resp.Error == "" {
-				t.Fatal("expected non-empty error message")
-			}
-		})
+	defer conn.Close()
+	_, _ = conn.Write([]byte("*1\r\n:1\r\n"))
+	reader := bufio.NewReader(conn)
+	got, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestErrorHandling_DBClosed(t *testing.T) {
-	db := setupTestDB(t)
-	srv := New(db)
-
-	// Close the DB to simulate underlying DB failure
-	if err := db.Close(); err != nil {
-		t.Fatalf("failed to close DB: %v", err)
+	if !bytes.HasPrefix([]byte(got), []byte("-ERR Protocol error:")) {
+		t.Fatalf("unexpected protocol error: %q", got)
 	}
-
-	putBody := []byte(`{"value":"hello"}`)
-	req := httptest.NewRequest(http.MethodPut, "/kv/foo", bytes.NewReader(putBody))
-	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
-
-	// Should return 503 Service Unavailable or 500
-	if rec.Code != http.StatusServiceUnavailable && rec.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 503 or 500 status for closed DB, got %d", rec.Code)
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := reader.ReadByte(); err == nil {
+		t.Fatal("connection remained open")
 	}
-
-	var resp errorResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to parse JSON response: %v", err)
-	}
-	if resp.Error == "" {
-		t.Fatal("expected non-empty error message")
-	}
-}
-
-func TestEmptyValue(t *testing.T) {
-	db := setupTestDB(t)
-	srv := New(db)
-
-	putBody := []byte(`{"value":""}`)
-	putReq := httptest.NewRequest(http.MethodPut, "/kv/emptykey", bytes.NewReader(putBody))
-	putRec := httptest.NewRecorder()
-	srv.ServeHTTP(putRec, putReq)
-
-	if putRec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d", putRec.Code)
-	}
-
-	getReq := httptest.NewRequest(http.MethodGet, "/kv/emptykey", nil)
-	getRec := httptest.NewRecorder()
-	srv.ServeHTTP(getRec, getReq)
-
-	if getRec.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d", getRec.Code)
-	}
-
-	var resp getResponse
-	if err := json.Unmarshal(getRec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
-	if resp.Value != "" {
-		t.Fatalf("expected empty value, got %q", resp.Value)
-	}
-}
-
-func TestConcurrentClients(t *testing.T) {
-	db := setupTestDB(t)
-	srv := New(db)
-
-	const numWorkers = 16
-	const opsPerWorker = 50
-
-	var wg sync.WaitGroup
-	wg.Add(numWorkers)
-
-	for worker := 0; worker < numWorkers; worker++ {
-		go func(workerID int) {
-			defer wg.Done()
-			for i := 0; i < opsPerWorker; i++ {
-				key := fmt.Sprintf("w%d_k%d", workerID, i)
-				val := fmt.Sprintf("v_%d_%d", workerID, i)
-
-				// PUT
-				putBody := []byte(fmt.Sprintf(`{"value":%q}`, val))
-				putReq := httptest.NewRequest(http.MethodPut, "/kv/"+key, bytes.NewReader(putBody))
-				putRec := httptest.NewRecorder()
-				srv.ServeHTTP(putRec, putReq)
-				if putRec.Code != http.StatusOK {
-					t.Errorf("worker %d: PUT %s failed: %d", workerID, key, putRec.Code)
-					return
-				}
-
-				// GET
-				getReq := httptest.NewRequest(http.MethodGet, "/kv/"+key, nil)
-				getRec := httptest.NewRecorder()
-				srv.ServeHTTP(getRec, getReq)
-				if getRec.Code != http.StatusOK {
-					t.Errorf("worker %d: GET %s failed: %d", workerID, key, getRec.Code)
-					return
-				}
-
-				var resp getResponse
-				if err := json.Unmarshal(getRec.Body.Bytes(), &resp); err != nil {
-					t.Errorf("worker %d: failed to parse GET: %v", workerID, err)
-					return
-				}
-				if resp.Value != val {
-					t.Errorf("worker %d: expected %s, got %s", workerID, val, resp.Value)
-					return
-				}
-			}
-		}(worker)
-	}
-
-	wg.Wait()
 }

@@ -1,24 +1,22 @@
 # LSM Key-Value Store
 
-An educational Log-Structured Merge-tree (LSM) key-value store in Go.
+An educational Log-Structured Merge-tree (LSM) key-value store in Go with a
+RESP2-compatible TCP server.
 
 ## Architecture
 
 The project maintains a clean separation between the storage engine internals and the HTTP adapter layer:
 
 ```text
-                 External programs / curl
-                  │         │          │
-                  │   HTTP  │          │
-                  ▼         ▼          ▼
+                 External programs / redis-cli
+                              │ RESP2
+                              ▼
               ┌───────────────────────────┐
-              │        HTTP Server        │
+              │        RESP2 Server       │
               │   (internal/server)       │
               │                           │
-              │   PUT /kv/:key            │
-              │   GET /kv/:key            │
-              │   DELETE /kv/:key         │
-              │   GET /health             │
+              │ SET / GET / DEL / MGET    │
+              │ MSET / EXISTS / PING      │
               └─────────────┬─────────────┘
                             │
                             ▼
@@ -34,7 +32,9 @@ The project maintains a clean separation between the storage engine internals an
         Flush Worker
 ```
 
-- **HTTP Server**: A thin adapter translating incoming JSON HTTP requests into calls to its `server.Store` interface. The production implementation is `engine.DB`, but the adapter is not coupled to that concrete engine and does not contain storage logic or server-level mutexes.
+- **RESP2 Server**: A thin adapter translating RESP2 commands into calls to its
+  `server.Store` interface. The production implementation is `engine.DB`; the
+  parser lives in `internal/protocol` and has no storage or socket dependency.
 - **engine.DB**: Coordinates active and frozen MemTables, WAL logging, and background SSTable flushes.
 
 The engine accepts one database data directory and keeps its storage
@@ -90,95 +90,50 @@ operation. Input files are removed only after the manifest update is durable.
 
 ## Starting the Server
 
-Build and start the server using `cmd/lsm-server`:
+Build and start the RESP2 server using `cmd/lsm-server`:
 
 ```bash
-go run ./cmd/lsm-server --addr :8080 --data-dir ./data
+go run ./cmd/lsm-server --addr :6380 --data-dir ./data
 ```
 
 Command-line flags:
-- `--addr`: HTTP listen address (default: `:8080`).
+- `--addr`: RESP2 TCP listen address (default: `:6380`).
 - `--data-dir`: Database root directory; WALs and SSTables are stored in its `wal/` and `tables/` subdirectories (default: `./data`).
 
 At startup, the server prints:
 ```text
-LSM server listening on :8080
+LSM RESP2 server listening on :6380
 data directory: ./data
 ```
 
 The server cleanly shuts down on `SIGINT` (Ctrl+C) and `SIGTERM`:
-1. Ceases accepting new HTTP requests.
+1. Ceases accepting new RESP2 connections.
 2. Gracefully finishes in-flight requests.
 3. Closes `engine.DB` and drains background flush and compaction workers before
    process exit.
 
 ---
 
-## Interacting with the Server (curl)
+## Interacting with the Server (redis-cli)
 
-### Health Check
-
-```bash
-curl http://localhost:8080/health
-```
-
-Response:
-```json
-{"status":"ok"}
-```
-
-### Put a Key-Value Pair
+### Set and get a key
 
 ```bash
-curl -X PUT \
-  -H 'Content-Type: application/json' \
-  -d '{"value":"hello"}' \
-  http://localhost:8080/kv/foo
+redis-cli -p 6380 SET foo hello
+redis-cli -p 6380 GET foo
 ```
 
-Response:
-```json
-{"key":"foo","status":"ok"}
-```
-
-### Get a Key
+### Delete and multi-key commands
 
 ```bash
-curl http://localhost:8080/kv/foo
+redis-cli -p 6380 DEL foo
+redis-cli -p 6380 MSET a one b two
+redis-cli -p 6380 MGET a b missing
+redis-cli -p 6380 EXISTS a b missing
 ```
 
-Response:
-```json
-{"key":"foo","value":"hello"}
-```
-
-### Get a Missing Key
-
-```bash
-curl -i http://localhost:8080/kv/does-not-exist
-```
-
-Response:
-```http
-HTTP/1.1 404 Not Found
-Content-Type: application/json
-
-{"error":"key not found"}
-```
-
-### Delete a Key
-
-```bash
-curl -X DELETE http://localhost:8080/kv/foo
-```
-
-Response:
-```json
-{"key":"foo","status":"deleted"}
-```
-
-Deleting a key that does not exist is also successful. A later `GET` returns
-`404 Not Found`.
+Missing keys return `(nil)` and deleting a missing key does not increase the
+delete count.
 
 ---
 
