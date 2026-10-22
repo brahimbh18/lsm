@@ -73,6 +73,7 @@ type DB struct {
 	compaction       compaction.CompactionPolicy
 	stats            FlushStats
 	options          Options
+	walSyncer        walSyncer
 	closed           bool
 	lastSequence     uint64
 	flushPending     int
@@ -86,6 +87,19 @@ func Open(options Options) (*DB, error) {
 	tablesDir := filepath.Join(options.DataDir, "tables")
 	if options.MemTableMaxSize <= 0 {
 		options.MemTableMaxSize = DefaultMemTableMaxSize
+	}
+	if options.SyncPolicy < SyncPolicyAlways || options.SyncPolicy > SyncPolicyNever {
+		return nil, fmt.Errorf("unknown WAL sync policy %d", options.SyncPolicy)
+	}
+	if options.SyncPolicy == SyncPolicyEverysec && options.SyncInterval <= 0 {
+		if options.SyncInterval == 0 {
+			options.SyncInterval = time.Second
+		} else {
+			return nil, fmt.Errorf("WAL sync interval must be positive for everysec")
+		}
+	}
+	if options.SyncPolicy == SyncPolicyAlways && options.SyncMode == SyncModeAsync {
+		options.SyncPolicy = SyncPolicyNever
 	}
 	if options.CompactionPolicy == (compaction.CompactionPolicy{}) {
 		options.CompactionPolicy = compaction.DefaultCompactionPolicy()
@@ -211,6 +225,7 @@ func Open(options Options) (*DB, error) {
 	db.log(1, "[DB] OPEN")
 	db.log(1, "[WAL] CREATE path=%s", db.active.wal.Path())
 	db.log(1, "[MEMTABLE] CREATE id=%d wal=%s", db.active.id, db.active.wal.Path())
+	db.walSyncer = newWalSyncer(options.SyncPolicy, options.SyncInterval, db.active.wal, db.log)
 	db.startFlushWorker()
 	db.startCompactionWorker()
 	return db, nil
@@ -327,6 +342,10 @@ func (db *DB) write(key, value []byte, tombstone bool) error {
 		db.mu.Unlock()
 		return err
 	}
+	if err := db.walSyncer.Err(); err != nil {
+		db.mu.Unlock()
+		return err
+	}
 	if db.lastSequence == ^uint64(0) {
 		db.mu.Unlock()
 		return ErrSequenceOverflow
@@ -338,11 +357,9 @@ func (db *DB) write(key, value []byte, tombstone bool) error {
 		db.mu.Unlock()
 		return err
 	}
-	if db.options.SyncMode == SyncModeSync {
-		if err := db.active.wal.Sync(); err != nil {
-			db.mu.Unlock()
-			return err
-		}
+	if err := db.walSyncer.AfterAppend(db.active.wal); err != nil {
+		db.mu.Unlock()
+		return err
 	}
 	if err := db.active.table.PutEntry(entry); err != nil {
 		db.mu.Unlock()
@@ -372,6 +389,13 @@ func (db *DB) write(key, value []byte, tombstone bool) error {
 	}
 	db.mu.Unlock()
 	if frozen != nil {
+		if err := db.walSyncer.OnRotate(frozen.state.wal, db.active.wal); err != nil {
+			db.mu.Lock()
+			if db.flushErr == nil {
+				db.flushErr = err
+			}
+			db.mu.Unlock()
+		}
 		db.log(1, "[FLUSH QUEUE] ENQUEUE memtable=%d queue_length=%d", frozen.state.id, len(db.flushQueue)+1)
 		db.flushQueue <- frozen
 	}
@@ -631,6 +655,7 @@ func (db *DB) Close() error {
 	db.flushWorker.Wait()
 	close(db.compactionQueue)
 	db.compactionWorker.Wait()
+	syncErr := db.walSyncer.Close()
 	db.mu.Lock()
 	flushErr := db.flushErr
 	activeErr := error(nil)
@@ -647,7 +672,7 @@ func (db *DB) Close() error {
 		task.state.walClosed = true
 	}
 	db.mu.Unlock()
-	return errors.Join(flushErr, activeErr)
+	return errors.Join(flushErr, syncErr, activeErr)
 }
 
 func walPath(directory string, id uint64) string {

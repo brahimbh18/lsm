@@ -20,6 +20,45 @@ func testOptions(directory string) Options {
 	}
 }
 
+func TestSyncPolicyParsing(t *testing.T) {
+	for value, want := range map[string]SyncPolicy{
+		"always": SyncPolicyAlways, "everysec": SyncPolicyEverysec, "never": SyncPolicyNever,
+	} {
+		got, err := ParseSyncPolicy(value)
+		if err != nil || got != want {
+			t.Fatalf("ParseSyncPolicy(%q) = %v, %v; want %v, nil", value, got, err, want)
+		}
+		if got.String() != value {
+			t.Fatalf("SyncPolicy.String() = %q, want %q", got.String(), value)
+		}
+	}
+	if _, err := ParseSyncPolicy("invalid"); err == nil {
+		t.Fatal("ParseSyncPolicy(invalid) returned nil error")
+	}
+}
+
+func TestEverysecRejectsNegativeInterval(t *testing.T) {
+	_, err := Open(Options{DataDir: t.TempDir(), SyncPolicy: SyncPolicyEverysec, SyncInterval: -time.Second})
+	if err == nil {
+		t.Fatal("Open() accepted a negative everysec interval")
+	}
+}
+
+func TestEverysecSyncsBeforeClose(t *testing.T) {
+	db, err := Open(Options{
+		DataDir: t.TempDir(), SyncPolicy: SyncPolicyEverysec, SyncInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPutFlushesFrozenMemTable(t *testing.T) {
 	directory := t.TempDir()
 	db, err := Open(testOptions(directory))
