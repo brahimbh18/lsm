@@ -93,17 +93,24 @@ operation. Input files are removed only after the manifest update is durable.
 Build and start the RESP2 server using `cmd/lsm-server`:
 
 ```bash
-go run ./cmd/lsm-server --addr :6380 --data-dir ./data
+go run ./cmd/lsm-server --addr :6380 --data-dir ./data --wal-sync everysec --wal-sync-interval 1s
 ```
 
 Command-line flags:
 - `--addr`: RESP2 TCP listen address (default: `:6380`).
 - `--data-dir`: Database root directory; WALs and SSTables are stored in its `wal/` and `tables/` subdirectories (default: `./data`).
+- `--wal-sync`: WAL durability policy: `always` (default), `everysec`, or `never`.
+- `--wal-sync-interval`: Background sync interval used by `everysec` (default: `1s`).
+
+`everysec` acknowledges writes after they reach the WAL file and syncs the
+active WAL periodically; it also performs a final sync during graceful
+shutdown. `never` does not call `fsync`, including during graceful shutdown.
 
 At startup, the server prints:
 ```text
 LSM RESP2 server listening on :6380
 data directory: ./data
+wal sync policy=always interval=1s
 ```
 
 The server cleanly shuts down on `SIGINT` (Ctrl+C) and `SIGTERM`:

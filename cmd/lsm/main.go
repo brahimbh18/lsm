@@ -2,24 +2,34 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"lsm/internal/engine"
 )
 
 func main() {
+	dataDir := flag.String("data-dir", envOrDefault("DATA_DIR", "data"), "database data directory")
+	walSync := flag.String("wal-sync", "always", "WAL sync policy: always, everysec, or never")
+	walSyncInterval := flag.Duration("wal-sync-interval", time.Second, "WAL sync interval for everysec")
+	flag.Parse()
+	syncPolicy, err := engine.ParseSyncPolicy(*walSync)
+	if err != nil {
+		log.Fatal(err)
+	}
 	db, err := engine.Open(engine.Options{
-		DataDir:  envOrDefault("DATA_DIR", "data"),
-		SyncMode: engine.SyncModeSync,
+		DataDir: *dataDir, SyncPolicy: syncPolicy, SyncInterval: *walSyncInterval,
 	})
 
 	if err != nil {
 		log.Fatal(err)
 	}
+	log.Printf("wal sync policy=%s interval=%s", syncPolicy, *walSyncInterval)
 
 	defer db.Close()
 
