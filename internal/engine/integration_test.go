@@ -133,7 +133,7 @@ func TestLargeWorkload(t *testing.T) {
 	t.Logf("========== QUERY RESULTS ==========")
 	t.Logf("Queries: %d, Found: %d, Not found: %d", len(queries), found, len(queries)-found)
 	t.Logf("Query latency: %s", summarizeLatencies(latencies))
-	t.Log("SSTable queries are not implemented; flushed data remains readable through immutable MemTables.")
+	t.Log("Flushed data is read from manifest-listed SSTables after frozen memtables are retired.")
 }
 
 func TestFlushFailureKeepsWAL(t *testing.T) {

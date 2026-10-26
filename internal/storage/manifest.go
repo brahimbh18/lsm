@@ -16,7 +16,8 @@ type TableMeta struct {
 }
 
 type Manifest struct {
-	Tables []TableMeta `json:"tables"`
+	Tables       []TableMeta `json:"tables"`
+	MinLiveWALID uint64      `json:"min_live_wal_id,omitempty"`
 }
 
 func ReadManifest(directory string) (Manifest, error) {

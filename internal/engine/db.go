@@ -21,10 +21,12 @@ import (
 var ErrClosed = errors.New("database is closed")
 
 type memTableState struct {
-	id        uint64
-	table     *memtable.MemTable
-	wal       *wal.WAL
-	walClosed bool
+	id           uint64
+	walThroughID uint64
+	walPaths     []string
+	table        *memtable.MemTable
+	wal          *wal.WAL
+	walClosed    bool
 }
 
 type flushTask struct {
@@ -77,6 +79,8 @@ type DB struct {
 	rotationCond     *sync.Cond
 	nextMemtableID   uint64
 	manifest         storage.Manifest
+	tableRefs        map[uint64]int
+	tableRefsCond    *sync.Cond
 	tablesDir        string
 	compaction       compaction.CompactionPolicy
 	stats            FlushStats
@@ -130,7 +134,11 @@ func Open(options Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	nextID := maxID(walIDs, mapIDs(sstIDs)) + 1
+	maxWALID := maxID(walIDs)
+	if maxWALID == ^uint64(0) {
+		return nil, ErrWALIDOverflow
+	}
+	nextID := maxWALID + 1
 
 	db := &DB{
 		flushQueue:      make(chan *flushTask, 1),
@@ -142,6 +150,7 @@ func Open(options Options) (*DB, error) {
 		options:         options,
 		tablesDir:       tablesDir,
 		compaction:      options.CompactionPolicy,
+		tableRefs:       make(map[uint64]int),
 	}
 	db.flushStorage, err = storage.NewStorage(tablesDir)
 	if err != nil {
@@ -169,6 +178,13 @@ func Open(options Options) (*DB, error) {
 	}
 	db.flushCond = sync.NewCond(&db.mu)
 	db.rotationCond = sync.NewCond(&db.mu)
+	db.tableRefsCond = sync.NewCond(&db.mu)
+	if db.manifest.MinLiveWALID >= nextID {
+		if db.manifest.MinLiveWALID == ^uint64(0) {
+			return nil, ErrWALIDOverflow
+		}
+		nextID = db.manifest.MinLiveWALID + 1
+	}
 
 	for id := range sstIDs {
 		data, err := os.ReadFile(filepath.Join(tablesDir, fmt.Sprintf("%06d.sst", id)))
@@ -184,54 +200,58 @@ func Open(options Options) (*DB, error) {
 		}
 	}
 
-	// Replay every WAL that has no corresponding SSTable. Until SSTable reads
-	// exist, replaying them into the active table is the explicit recovery limit.
+	// Replay WALs at or above the manifest's minimum live ID. SSTable IDs are
+	// independent and must not be used to decide whether a WAL was flushed.
+	recoveredWALPaths := make([]string, 0, len(walIDs))
+	activeWALID := uint64(0)
+	var activeWAL *wal.WAL
+	recoveredTable := memtable.New(options.MemTableMaxSize)
 	for _, id := range walIDs {
-		if _, ok := sstIDs[id]; ok {
+		if id < db.manifest.MinLiveWALID {
 			continue
 		}
 		path := walPath(walDir, id)
 		recovered, err := wal.Open(path)
 		if err != nil {
+			if activeWAL != nil {
+				_ = activeWAL.Close()
+			}
 			return nil, err
 		}
-		if db.active == nil {
-			db.active, err = db.newState(id, recovered)
-			if err != nil {
-				return nil, err
+		err = recovered.Replay(func(entry memtable.Entry) error {
+			if entry.Seq > db.lastSequence {
+				db.lastSequence = entry.Seq
 			}
-			err = recovered.Replay(func(entry memtable.Entry) error {
-				if entry.Seq > db.lastSequence {
-					db.lastSequence = entry.Seq
-				}
-				return db.active.table.PutEntry(entry)
-			})
-			if err != nil {
-				_ = recovered.Close()
-				return nil, err
-			}
-		} else {
-			err = recovered.Replay(func(entry memtable.Entry) error {
-				if entry.Seq > db.lastSequence {
-					db.lastSequence = entry.Seq
-				}
-				return db.active.table.PutEntry(entry)
-			})
-			if err != nil {
-				_ = recovered.Close()
-				return nil, err
-			}
+			return recoveredTable.PutEntry(entry)
+		})
+		if err != nil {
 			_ = recovered.Close()
+			if activeWAL != nil {
+				_ = activeWAL.Close()
+			}
+			return nil, err
 		}
+		if activeWAL != nil {
+			if err := activeWAL.Close(); err != nil {
+				_ = recovered.Close()
+				return nil, err
+			}
+		}
+		activeWAL, activeWALID = recovered, id
+		recoveredWALPaths = append(recoveredWALPaths, path)
 	}
-	if db.active == nil {
+	if activeWAL != nil {
+		db.active = &memTableState{
+			id: activeWALID, walThroughID: activeWALID,
+			walPaths: recoveredWALPaths, table: recoveredTable, wal: activeWAL,
+		}
+		db.nextMemtableID = nextID
+	} else {
 		db.active, err = db.newState(nextID, nil)
 		if err != nil {
 			return nil, err
 		}
 		db.nextMemtableID = nextID + 1
-	} else {
-		db.nextMemtableID = maxID([]uint64{db.active.id + 1}, nil)
 	}
 	db.stats.MemTablesCreated = 1
 	db.log(1, "[DB] OPEN")
@@ -256,12 +276,20 @@ func (db *DB) newState(id uint64, existing *wal.WAL) (*memTableState, error) {
 		}
 
 	}
-	return &memTableState{id: id, table: memtable.New(db.options.MemTableMaxSize), wal: current}, nil
+	return &memTableState{
+		id: id, walThroughID: id, walPaths: []string{current.Path()},
+		table: memtable.New(db.options.MemTableMaxSize), wal: current,
+	}, nil
 }
 
 func (db *DB) createState(id uint64, existing *wal.WAL) (*memTableState, error) {
 	if db.newStateHook != nil {
-		return db.newStateHook(id, existing)
+		state, err := db.newStateHook(id, existing)
+		if state != nil && state.wal != nil && len(state.walPaths) == 0 {
+			state.walThroughID = id
+			state.walPaths = []string{state.wal.Path()}
+		}
+		return state, err
 	}
 	return db.newState(id, existing)
 }
@@ -304,7 +332,12 @@ func (db *DB) startFlushWorker() {
 		defer db.flushWorker.Done()
 		for task := range db.flushQueue {
 			db.log(1, "[FLUSH WORKER] RECEIVED memtable=%d wal=%s", task.state.id, task.state.wal.Path())
-			err := db.flush(task)
+			db.mu.RLock()
+			err := db.flushErr
+			db.mu.RUnlock()
+			if err == nil {
+				err = db.flush(task)
+			}
 
 			db.mu.Lock()
 			if err != nil && !task.state.walClosed {
@@ -498,32 +531,34 @@ func (db *DB) write(key, value []byte, tombstone bool) error {
 }
 
 func (db *DB) Get(key []byte) ([]byte, bool) {
-	db.manifestMu.Lock()
-	defer db.manifestMu.Unlock()
-	db.mu.RLock()
-	if entry, ok := db.active.table.Lookup(key); ok {
-		db.mu.RUnlock()
-		if entry.Tombstone {
-			return nil, false
-		}
-		return entry.Value, true
-	}
-	for index := len(db.frozenMemtables) - 1; index >= 0; index-- {
-		if entry, ok := db.frozenMemtables[index].state.table.Lookup(key); ok {
-			db.mu.RUnlock()
-			if entry.Tombstone {
-				return nil, false
-			}
-			return entry.Value, true
-		}
+	db.mu.Lock()
+	active := db.active.table
+	frozen := make([]*memtable.MemTable, 0, len(db.frozenMemtables))
+	for _, task := range db.frozenMemtables {
+		frozen = append(frozen, task.state.table)
 	}
 	tables := append([]storage.TableMeta(nil), db.manifest.Tables...)
-	db.mu.RUnlock()
+	for _, table := range tables {
+		db.tableRefs[table.ID]++
+	}
+	db.mu.Unlock()
+	defer db.releaseTableRefs(tables)
 
 	var newest memtable.Entry
 	found := false
+	if entry, ok := active.Lookup(key); ok {
+		newest, found = entry, true
+	}
+	for index := len(frozen) - 1; index >= 0; index-- {
+		if entry, ok := frozen[index].Lookup(key); ok && (!found || entry.Seq > newest.Seq) {
+			newest, found = entry, true
+		}
+	}
 	tableStore, ok := db.flushStorage.(compactableStorage)
 	if !ok {
+		if found && !newest.Tombstone {
+			return newest.Value, true
+		}
 		return nil, false
 	}
 	for _, meta := range tables {
@@ -553,6 +588,37 @@ func (db *DB) Get(key []byte) ([]byte, bool) {
 	return nil, false
 }
 
+func (db *DB) releaseTableRefs(tables []storage.TableMeta) {
+	db.mu.Lock()
+	for _, table := range tables {
+		if db.tableRefs[table.ID] <= 1 {
+			delete(db.tableRefs, table.ID)
+		} else {
+			db.tableRefs[table.ID]--
+		}
+	}
+	db.tableRefsCond.Broadcast()
+	db.mu.Unlock()
+}
+
+func (db *DB) waitForTableRefs(ids []uint64) {
+	db.mu.Lock()
+	for {
+		inUse := false
+		for _, id := range ids {
+			if db.tableRefs[id] > 0 {
+				inUse = true
+				break
+			}
+		}
+		if !inUse {
+			break
+		}
+		db.tableRefsCond.Wait()
+	}
+	db.mu.Unlock()
+}
+
 func (db *DB) flush(task *flushTask) error {
 	start := time.Now()
 	db.log(1, "[FLUSH] START memtable=%d wal=%s", task.state.id, task.state.wal.Path())
@@ -575,24 +641,44 @@ func (db *DB) flush(task *flushTask) error {
 		return err
 	}
 	db.manifestMu.Lock()
-	defer db.manifestMu.Unlock()
-	db.mu.Lock()
-	db.manifest.Tables = append(db.manifest.Tables, meta)
+	db.mu.RLock()
 	manifest := db.manifest
-	db.mu.Unlock()
+	manifest.Tables = append(append([]storage.TableMeta(nil), db.manifest.Tables...), meta)
+	if task.state.walThroughID >= manifest.MinLiveWALID {
+		if task.state.walThroughID == ^uint64(0) {
+			db.mu.RUnlock()
+			db.manifestMu.Unlock()
+			return ErrWALIDOverflow
+		}
+		manifest.MinLiveWALID = task.state.walThroughID + 1
+	}
+	db.mu.RUnlock()
 	manifestStart := time.Now()
 	if err := storage.WriteManifest(db.tablesDir, manifest); err != nil {
+		db.manifestMu.Unlock()
 		return err
 	}
 	manifestDuration := time.Since(manifestStart)
+	db.mu.Lock()
+	db.manifest = manifest
+	for index, frozen := range db.frozenMemtables {
+		if frozen == task {
+			db.frozenMemtables = append(db.frozenMemtables[:index], db.frozenMemtables[index+1:]...)
+			break
+		}
+	}
+	db.mu.Unlock()
+	db.manifestMu.Unlock()
 	if err := task.state.wal.Close(); err != nil {
 		return err
 	}
 	db.mu.Lock()
 	task.state.walClosed = true
 	db.mu.Unlock()
-	if err := os.Remove(task.state.wal.Path()); err != nil {
-		return err
+	for _, path := range task.state.walPaths {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 	db.mu.Lock()
 	db.stats.SSTableBytes += result.Size
@@ -636,8 +722,6 @@ func (db *DB) compactOneTriggeredLevel() (bool, error) {
 		return false, nil
 	}
 
-	db.manifestMu.Lock()
-	defer db.manifestMu.Unlock()
 	db.mu.RLock()
 	tables := append([]storage.TableMeta(nil), db.manifest.Tables...)
 	db.mu.RUnlock()
@@ -706,25 +790,58 @@ func (db *DB) compactOneTriggeredLevel() (bool, error) {
 	}
 	mergedMeta, err := tableMeta(result.ID, level+1, merged)
 	if err != nil {
+		_ = tableStore.Delete(result.ID)
 		return false, err
 	}
-	updated := storage.Manifest{Tables: make([]storage.TableMeta, 0, len(tables)-len(inputs)+1)}
 	inputIDs := make(map[uint64]struct{}, len(inputs))
 	for _, input := range inputs {
 		inputIDs[input.ID] = struct{}{}
 	}
-	for _, table := range tables {
+
+	// Compaction I/O runs without manifestMu. Serialize only the install step,
+	// validate the input snapshot, and preserve tables flushed while it ran.
+	db.manifestMu.Lock()
+	db.mu.RLock()
+	current := db.manifest
+	db.mu.RUnlock()
+	present := make(map[uint64]struct{}, len(inputs))
+	for _, table := range current.Tables {
+		if _, wanted := inputIDs[table.ID]; wanted {
+			present[table.ID] = struct{}{}
+		}
+	}
+	if len(present) != len(inputIDs) {
+		db.manifestMu.Unlock()
+		if err := tableStore.Delete(result.ID); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	updated := storage.Manifest{
+		Tables:       make([]storage.TableMeta, 0, len(current.Tables)-len(inputs)+1),
+		MinLiveWALID: current.MinLiveWALID,
+	}
+	for _, table := range current.Tables {
 		if _, remove := inputIDs[table.ID]; !remove {
 			updated.Tables = append(updated.Tables, table)
 		}
 	}
 	updated.Tables = append(updated.Tables, mergedMeta)
 	if err := storage.WriteManifest(db.tablesDir, updated); err != nil {
+		db.manifestMu.Unlock()
+		_ = tableStore.Delete(result.ID)
 		return false, err
 	}
 	db.mu.Lock()
 	db.manifest = updated
 	db.mu.Unlock()
+	db.manifestMu.Unlock()
+
+	inputIDsList := make([]uint64, 0, len(inputIDs))
+	for id := range inputIDs {
+		inputIDsList = append(inputIDsList, id)
+	}
+	db.waitForTableRefs(inputIDsList)
 	for _, input := range inputs {
 		if err := tableStore.Delete(input.ID); err != nil {
 			return false, err
@@ -842,12 +959,4 @@ func maxID(groups ...[]uint64) uint64 {
 		}
 	}
 	return max
-}
-
-func mapIDs(ids map[uint64]bool) []uint64 {
-	result := make([]uint64, 0, len(ids))
-	for id := range ids {
-		result = append(result, id)
-	}
-	return result
 }

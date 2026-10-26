@@ -7,12 +7,14 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"lsm/internal/memtable"
 	"lsm/internal/storage"
 	"lsm/internal/storage/compaction"
+	"lsm/internal/storage/sstable"
 	"lsm/internal/wal"
 )
 
@@ -86,8 +88,15 @@ func TestPutFlushesFrozenMemTable(t *testing.T) {
 	db.mu.Lock()
 	frozenCount := len(db.frozenMemtables)
 	db.mu.Unlock()
-	if frozenCount != 1 {
-		t.Fatalf("immutable MemTables remaining = %d, want 1", frozenCount)
+	if frozenCount != 0 {
+		t.Fatalf("immutable MemTables remaining after flush = %d, want 0", frozenCount)
+	}
+	manifest, err := storage.ReadManifest(filepath.Join(directory, "tables"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.MinLiveWALID != 2 {
+		t.Fatalf("minimum live WAL ID = %d, want 2", manifest.MinLiveWALID)
 	}
 	if got, ok := db.Get([]byte("key")); !ok || !bytes.Equal(got, []byte("value!!!")) {
 		t.Fatalf("flushed key = %q, found=%v", got, ok)
@@ -443,6 +452,254 @@ func TestGetReadsPersistedSSTablesAfterReopen(t *testing.T) {
 	if !ok || !bytes.Equal(got, []byte("value")) {
 		t.Fatalf("persisted Get() = %q, found=%v", got, ok)
 	}
+}
+
+func TestRecoveryUsesManifestWALBoundaryNotSSTableIDs(t *testing.T) {
+	directory := t.TempDir()
+	walDir := filepath.Join(directory, "wal")
+	tablesDir := filepath.Join(directory, "tables")
+	if err := os.MkdirAll(walDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(tablesDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	oldTable := memtable.New(0)
+	if err := oldTable.PutEntry(memtable.Entry{Key: []byte("table-key"), Value: []byte("table-value"), Seq: 1}); err != nil {
+		t.Fatal(err)
+	}
+	table, err := sstable.NewBuilder().Build(oldTable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tablesDir, "000002.sst"), table.Data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := tableMeta(2, 0, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.WriteManifest(tablesDir, storage.Manifest{
+		Tables: []storage.TableMeta{meta}, MinLiveWALID: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	activeWAL, err := wal.Open(walPath(walDir, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := activeWAL.AppendEntry(memtable.Entry{Key: []byte("wal-key"), Value: []byte("wal-value"), Seq: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := activeWAL.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(testOptions(directory))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if value, ok := db.Get([]byte("wal-key")); !ok || !bytes.Equal(value, []byte("wal-value")) {
+		t.Fatalf("WAL with colliding SSTable ID: value=%q found=%v", value, ok)
+	}
+	if value, ok := db.Get([]byte("table-key")); !ok || !bytes.Equal(value, []byte("table-value")) {
+		t.Fatalf("manifest SSTable: value=%q found=%v", value, ok)
+	}
+}
+
+func TestLegacyWALReplayCannotMaskNewerSSTableVersion(t *testing.T) {
+	directory := t.TempDir()
+	walDir := filepath.Join(directory, "wal")
+	tablesDir := filepath.Join(directory, "tables")
+	if err := os.MkdirAll(walDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(tablesDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	newest := memtable.New(0)
+	if err := newest.PutEntry(memtable.Entry{Key: []byte("key"), Value: []byte("new"), Seq: 2}); err != nil {
+		t.Fatal(err)
+	}
+	table, err := sstable.NewBuilder().Build(newest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tablesDir, "000001.sst"), table.Data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := tableMeta(1, 0, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.WriteManifest(tablesDir, storage.Manifest{Tables: []storage.TableMeta{meta}}); err != nil {
+		t.Fatal(err)
+	}
+	legacyWAL, err := wal.Open(walPath(walDir, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacyWAL.AppendEntry(memtable.Entry{Key: []byte("key"), Value: []byte("old"), Seq: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacyWAL.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(testOptions(directory))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if value, ok := db.Get([]byte("key")); !ok || !bytes.Equal(value, []byte("new")) {
+		t.Fatalf("legacy replay Get() = %q, found=%v; want newest SSTable value", value, ok)
+	}
+}
+
+func TestCompactionDoesNotBlockSnapshotReadsOrDeletePinnedInputs(t *testing.T) {
+	directory := t.TempDir()
+	db, err := Open(Options{DataDir: directory, MemTableMaxSize: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Put([]byte("k"), []byte("1234567")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WaitForFlushes(); err != nil {
+		t.Fatal(err)
+	}
+
+	base := db.flushStorage.(compactableStorage)
+	gate := &compactionReadGate{
+		inner: base, compactionStarted: make(chan struct{}), releaseCompaction: make(chan struct{}),
+		readerStarted: make(chan struct{}), releaseReader: make(chan struct{}), deleted: make(chan struct{}),
+	}
+	db.flushStorage = gate
+	db.compaction = compaction.CompactionPolicy{L0TargetBytes: 1, L0FileTrigger: 1, LevelMultiplier: 10}
+
+	compactDone := make(chan error, 1)
+	go func() {
+		_, err := db.compactOneTriggeredLevel()
+		compactDone <- err
+	}()
+	select {
+	case <-gate.compactionStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("compaction did not begin reading its input")
+	}
+
+	getDone := make(chan struct {
+		value []byte
+		ok    bool
+	}, 1)
+	go func() {
+		value, ok := db.Get([]byte("k"))
+		getDone <- struct {
+			value []byte
+			ok    bool
+		}{value, ok}
+	}()
+	select {
+	case <-gate.readerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Get did not read its captured SSTable snapshot")
+	}
+
+	close(gate.releaseCompaction)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		manifest, readErr := storage.ReadManifest(filepath.Join(directory, "tables"))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if len(manifest.Tables) == 1 && manifest.Tables[0].Level == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	manifest, err := storage.ReadManifest(filepath.Join(directory, "tables"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Tables) != 1 || manifest.Tables[0].Level != 1 {
+		t.Fatalf("compaction did not install output manifest: %+v", manifest.Tables)
+	}
+	select {
+	case <-gate.deleted:
+		t.Fatal("compaction deleted an input while a reader still held its snapshot")
+	default:
+	}
+	select {
+	case err := <-compactDone:
+		t.Fatalf("compaction finished before its reader released the input: %v", err)
+	default:
+	}
+
+	close(gate.releaseReader)
+	select {
+	case result := <-getDone:
+		if !result.ok || !bytes.Equal(result.value, []byte("1234567")) {
+			t.Fatalf("snapshot Get() = %q, found=%v", result.value, result.ok)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Get did not finish after its input read was released")
+	}
+	select {
+	case err := <-compactDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("compaction did not finish after the reader released its snapshot")
+	}
+	select {
+	case <-gate.deleted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("compaction did not delete its retired input")
+	}
+}
+
+type compactionReadGate struct {
+	inner             compactableStorage
+	readCalls         int32
+	compactionStarted chan struct{}
+	releaseCompaction chan struct{}
+	readerStarted     chan struct{}
+	releaseReader     chan struct{}
+	deleted           chan struct{}
+}
+
+func (g *compactionReadGate) WriteWithInfo(table *sstable.SSTable) (storage.WriteResult, error) {
+	return g.inner.WriteWithInfo(table)
+}
+
+func (g *compactionReadGate) Read(id uint64) (*sstable.SSTable, error) {
+	switch atomic.AddInt32(&g.readCalls, 1) {
+	case 1:
+		close(g.compactionStarted)
+		<-g.releaseCompaction
+	case 2:
+		close(g.readerStarted)
+		<-g.releaseReader
+	}
+	return g.inner.Read(id)
+}
+
+func (g *compactionReadGate) Delete(id uint64) error {
+	if err := g.inner.Delete(id); err != nil {
+		return err
+	}
+	select {
+	case <-g.deleted:
+	default:
+		close(g.deleted)
+	}
+	return nil
 }
 
 func TestSequenceOverflow(t *testing.T) {
