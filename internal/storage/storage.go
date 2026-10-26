@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"lsm/internal/storage/sstable"
 )
@@ -19,9 +20,12 @@ type Storage struct {
 }
 
 type WriteResult struct {
-	ID   uint64
-	Path string
-	Size int64
+	ID        uint64
+	Path      string
+	Size      int64
+	WriteTime time.Duration
+	SyncTime  time.Duration
+	CloseTime time.Duration
 }
 
 func NewStorage(directory string) (*Storage, error) {
@@ -52,7 +56,9 @@ func (s *Storage) WriteWithInfo(table *sstable.SSTable) (WriteResult, error) {
 		return WriteResult{}, err
 	}
 
+	writeStart := time.Now()
 	written, err := file.Write(table.Data)
+	writeTime := time.Since(writeStart)
 	if err != nil {
 		_ = file.Close()
 		return WriteResult{}, err
@@ -61,17 +67,24 @@ func (s *Storage) WriteWithInfo(table *sstable.SSTable) (WriteResult, error) {
 		_ = file.Close()
 		return WriteResult{}, io.ErrShortWrite
 	}
+	syncStart := time.Now()
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
 		return WriteResult{}, err
 	}
+	syncTime := time.Since(syncStart)
+	closeStart := time.Now()
 	if err := file.Close(); err != nil {
 		return WriteResult{}, err
 	}
+	closeTime := time.Since(closeStart)
 
 	id := s.nextID
 	s.nextID++
-	return WriteResult{ID: id, Path: path, Size: int64(len(table.Data))}, nil
+	return WriteResult{
+		ID: id, Path: path, Size: int64(len(table.Data)),
+		WriteTime: writeTime, SyncTime: syncTime, CloseTime: closeTime,
+	}, nil
 }
 
 func (s *Storage) Read(id uint64) (*sstable.SSTable, error) {

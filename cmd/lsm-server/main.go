@@ -5,8 +5,11 @@ import (
 	"flag"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"syscall"
 	"time"
@@ -20,7 +23,17 @@ func main() {
 	dataDir := flag.String("data-dir", "./data", "database data directory")
 	walSync := flag.String("wal-sync", "always", "WAL sync policy: always, everysec, or never")
 	walSyncInterval := flag.Duration("wal-sync-interval", time.Second, "WAL sync interval for everysec")
+	pprofAddr := flag.String("pprof", "", "optional pprof listen address (for example 127.0.0.1:6060)")
 	flag.Parse()
+	if *pprofAddr != "" {
+		runtime.SetBlockProfileRate(1)
+		runtime.SetMutexProfileFraction(1)
+		go func() {
+			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+				log.Printf("pprof server error: %v", err)
+			}
+		}()
+	}
 	syncPolicy, err := engine.ParseSyncPolicy(*walSync)
 	if err != nil {
 		log.Fatal(err)

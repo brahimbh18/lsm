@@ -2,6 +2,8 @@ package engine
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -11,6 +13,7 @@ import (
 	"lsm/internal/memtable"
 	"lsm/internal/storage"
 	"lsm/internal/storage/compaction"
+	"lsm/internal/wal"
 )
 
 func testOptions(directory string) Options {
@@ -237,6 +240,7 @@ func TestConcurrentPutsHaveUniqueSequences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer db.Close()
 
 	const writes = 100
@@ -262,6 +266,115 @@ func TestConcurrentPutsHaveUniqueSequences(t *testing.T) {
 			t.Fatalf("duplicate sequence %d", entry.Seq)
 		}
 		seen[entry.Seq] = true
+	}
+}
+
+func TestRotationFailureLeavesStateUnchanged(t *testing.T) {
+	db, err := Open(testOptions(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	before := db.active
+	wantErr := errors.New("injected state creation failure")
+	db.newStateHook = func(uint64, *wal.WAL) (*memTableState, error) {
+		return nil, wantErr
+	}
+	if err := db.Put([]byte("key"), []byte("value-too-large")); !errors.Is(err, wantErr) {
+		t.Fatalf("Put() error = %v, want %v", err, wantErr)
+	}
+	db.mu.RLock()
+	if db.active != before {
+		db.mu.RUnlock()
+		t.Fatal("active state changed after failed rotation")
+	}
+	if len(db.frozenMemtables) != 0 {
+		db.mu.RUnlock()
+		t.Fatalf("frozen memtables = %d, want 0", len(db.frozenMemtables))
+	}
+	if db.flushPending != 0 {
+		db.mu.RUnlock()
+		t.Fatalf("flush pending = %d, want 0", db.flushPending)
+	}
+	db.mu.RUnlock()
+	if err := db.Put([]byte("later"), []byte("value")); !errors.Is(err, wantErr) {
+		t.Fatalf("later Put() error = %v, want sticky %v", err, wantErr)
+	}
+}
+
+func TestAppendFailureIsSticky(t *testing.T) {
+	db, err := Open(Options{DataDir: t.TempDir(), MemTableMaxSize: 1024})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	wantErr := errors.New("injected append failure")
+	db.appendEntryHook = func(*wal.WAL, memtable.Entry) error {
+		return wantErr
+	}
+	if err := db.Put([]byte("key"), []byte("value")); !errors.Is(err, wantErr) {
+		t.Fatalf("Put() error = %v, want %v", err, wantErr)
+	}
+	db.appendEntryHook = nil
+	if err := db.Put([]byte("later"), []byte("value")); !errors.Is(err, wantErr) {
+		t.Fatalf("later Put() error = %v, want sticky %v", err, wantErr)
+	}
+}
+
+func TestFlushFailureDoesNotDeadlockWritersOrClose(t *testing.T) {
+	db, err := Open(Options{DataDir: t.TempDir(), MemTableMaxSize: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.flushStorage = failingStorage{}
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WaitForFlushes(); err == nil {
+		t.Fatal("WaitForFlushes() error = nil, want flush failure")
+	}
+	if err := db.Put([]byte("later"), []byte("value")); err == nil {
+		t.Fatal("Put() after flush failure returned nil")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- db.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close() did not return after flush failure")
+	}
+}
+
+func TestConcurrentRotationsRemainReadable(t *testing.T) {
+	db, err := Open(Options{DataDir: t.TempDir(), MemTableMaxSize: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const writes = 500
+	var wait sync.WaitGroup
+	for i := 0; i < writes; i++ {
+		wait.Add(1)
+		go func(i int) {
+			defer wait.Done()
+			key := []byte(fmt.Sprintf("key-%03d", i))
+			if err := db.Put(key, []byte("value")); err != nil {
+				t.Errorf("Put(%q): %v", key, err)
+			}
+		}(i)
+	}
+	wait.Wait()
+	if err := db.WaitForFlushes(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < writes; i++ {
+		key := []byte(fmt.Sprintf("key-%03d", i))
+		if value, ok := db.Get(key); !ok || !bytes.Equal(value, []byte("value")) {
+			t.Fatalf("Get(%q) = %q, %v", key, value, ok)
+		}
 	}
 }
 

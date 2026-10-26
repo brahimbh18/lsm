@@ -50,12 +50,18 @@ type FlushStats struct {
 	L0SSTablesCreated  int
 	SSTableBytes       int64
 	TotalSSTableBlocks int
+	FlushDuration      time.Duration
+	Compactions        int
+	CompactionDuration time.Duration
+	QueueWaits         int
+	QueueWaitDuration  time.Duration
 }
 
 type DB struct {
 	mu               sync.RWMutex
 	manifestMu       sync.Mutex
 	queueMu          sync.Mutex
+	rotationMu       sync.Mutex
 	active           *memTableState
 	frozenMemtables  []*flushTask
 	flushQueue       chan *flushTask
@@ -66,7 +72,9 @@ type DB struct {
 	flushStorage     sstableStorage
 	flushDone        chan struct{}
 	flushErr         error
+	writeErr         error
 	flushCond        *sync.Cond
+	rotationCond     *sync.Cond
 	nextMemtableID   uint64
 	manifest         storage.Manifest
 	tablesDir        string
@@ -77,6 +85,9 @@ type DB struct {
 	closed           bool
 	lastSequence     uint64
 	flushPending     int
+	rotating         bool
+	newStateHook     func(uint64, *wal.WAL) (*memTableState, error)
+	appendEntryHook  func(*wal.WAL, memtable.Entry) error
 }
 
 func Open(options Options) (*DB, error) {
@@ -157,6 +168,7 @@ func Open(options Options) (*DB, error) {
 		}
 	}
 	db.flushCond = sync.NewCond(&db.mu)
+	db.rotationCond = sync.NewCond(&db.mu)
 
 	for id := range sstIDs {
 		data, err := os.ReadFile(filepath.Join(tablesDir, fmt.Sprintf("%06d.sst", id)))
@@ -223,6 +235,9 @@ func Open(options Options) (*DB, error) {
 	}
 	db.stats.MemTablesCreated = 1
 	db.log(1, "[DB] OPEN")
+	db.log(1, "[DB] CONFIG memtable_threshold=%d flush_queue_capacity=%d compaction_l0_bytes=%d compaction_l0_files=%d compaction_level_multiplier=%d",
+		options.MemTableMaxSize, cap(db.flushQueue), options.CompactionPolicy.L0TargetBytes,
+		options.CompactionPolicy.L0FileTrigger, options.CompactionPolicy.LevelMultiplier)
 	db.log(1, "[WAL] CREATE path=%s", db.active.wal.Path())
 	db.log(1, "[MEMTABLE] CREATE id=%d wal=%s", db.active.id, db.active.wal.Path())
 	db.walSyncer = newWalSyncer(options.SyncPolicy, options.SyncInterval, db.active.wal, db.log)
@@ -239,8 +254,48 @@ func (db *DB) newState(id uint64, existing *wal.WAL) (*memTableState, error) {
 		if err != nil {
 			return nil, err
 		}
+
 	}
 	return &memTableState{id: id, table: memtable.New(db.options.MemTableMaxSize), wal: current}, nil
+}
+
+func (db *DB) createState(id uint64, existing *wal.WAL) (*memTableState, error) {
+	if db.newStateHook != nil {
+		return db.newStateHook(id, existing)
+	}
+	return db.newState(id, existing)
+}
+
+func (db *DB) setWriteError(err error) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.setWriteErrorLocked(err)
+}
+
+func (db *DB) setWriteErrorLocked(err error) error {
+	if db.writeErr == nil {
+		db.writeErr = err
+	}
+	return db.writeErr
+}
+
+func (db *DB) checkWritableLocked() error {
+	if db.closed {
+		return ErrClosed
+	}
+	if db.writeErr != nil {
+		return db.writeErr
+	}
+	if db.flushErr != nil {
+		return db.flushErr
+	}
+	if err := db.walSyncer.Err(); err != nil {
+		return db.setWriteErrorLocked(err)
+	}
+	if db.lastSequence == ^uint64(0) {
+		return ErrSequenceOverflow
+	}
+	return nil
 }
 
 func (db *DB) startFlushWorker() {
@@ -330,75 +385,115 @@ func (db *DB) Delete(key []byte) error {
 }
 
 func (db *DB) write(key, value []byte, tombstone bool) error {
-	db.queueMu.Lock()
-	defer db.queueMu.Unlock()
-	db.mu.Lock()
-	if db.closed {
+	for {
+		db.queueMu.Lock()
+		db.mu.Lock()
+		if !db.rotating {
+			break
+		}
 		db.mu.Unlock()
-		return ErrClosed
+		db.queueMu.Unlock()
+		db.mu.Lock()
+		for db.rotating {
+			db.rotationCond.Wait()
+		}
+		db.mu.Unlock()
 	}
-	if db.flushErr != nil {
-		err := db.flushErr
+
+	if err := db.checkWritableLocked(); err != nil {
 		db.mu.Unlock()
+		db.queueMu.Unlock()
 		return err
-	}
-	if err := db.walSyncer.Err(); err != nil {
-		db.mu.Unlock()
-		return err
-	}
-	if db.lastSequence == ^uint64(0) {
-		db.mu.Unlock()
-		return ErrSequenceOverflow
 	}
 	db.lastSequence++
 	sequence := db.lastSequence
+	active := db.active
+	db.mu.Unlock()
+
 	entry := memtable.Entry{Key: key, Value: value, Seq: sequence, Tombstone: tombstone}
-	if err := db.active.wal.AppendEntry(entry); err != nil {
-		db.mu.Unlock()
-		return err
+	appendEntry := active.wal.AppendEntry
+	if db.appendEntryHook != nil {
+		appendEntry = func(entry memtable.Entry) error {
+			return db.appendEntryHook(active.wal, entry)
+		}
 	}
-	if err := db.walSyncer.AfterAppend(db.active.wal); err != nil {
-		db.mu.Unlock()
-		return err
+	if err := appendEntry(entry); err != nil {
+		db.queueMu.Unlock()
+		return db.setWriteError(err)
 	}
-	if err := db.active.table.PutEntry(entry); err != nil {
-		db.mu.Unlock()
-		return err
+	if err := db.walSyncer.AfterAppend(active.wal); err != nil {
+		db.queueMu.Unlock()
+		return db.setWriteError(err)
 	}
-	db.log(2, "[WRITE] key=%s wal=%s", key, db.active.wal.Path())
+	if err := active.table.PutEntry(entry); err != nil {
+		db.queueMu.Unlock()
+		return db.setWriteError(err)
+	}
+	db.log(2, "[WRITE] key=%s wal=%s", key, active.wal.Path())
+	db.mu.Lock()
 	db.stats.RecordsWritten++
 	db.stats.BytesWritten += int64(len(key) + len(value))
-	var frozen *flushTask
-	if db.active.table.IsFull() {
-		frozen = &flushTask{state: db.active}
-		db.active.table.Freeze()
-		db.frozenMemtables = append(db.frozenMemtables, frozen)
-		db.flushPending++
-		db.stats.MemTablesFrozen++
-		db.log(1, "[MEMTABLE] FULL id=%d size=%d threshold=%d", db.active.id, db.active.table.Size(), db.options.MemTableMaxSize)
-		db.log(1, "[MEMTABLE] FREEZE id=%d wal=%s entries=%d", db.active.id, db.active.wal.Path(), len(db.active.table.Entries()))
-		var err error
-		db.active, err = db.newState(db.nextMemtableID, nil)
-		if err != nil {
-			db.mu.Unlock()
-			return err
-		}
-		db.nextMemtableID++
-		db.stats.MemTablesCreated++
-		db.log(1, "[MEMTABLE] CREATE id=%d wal=%s", db.active.id, db.active.wal.Path())
+	full := active.table.IsFull()
+	nextID := db.nextMemtableID
+	if full {
+		db.rotationMu.Lock()
+		db.rotating = true
 	}
 	db.mu.Unlock()
-	if frozen != nil {
-		if err := db.walSyncer.OnRotate(frozen.state.wal, db.active.wal); err != nil {
-			db.mu.Lock()
-			if db.flushErr == nil {
-				db.flushErr = err
-			}
-			db.mu.Unlock()
-		}
-		db.log(1, "[FLUSH QUEUE] ENQUEUE memtable=%d queue_length=%d", frozen.state.id, len(db.flushQueue)+1)
-		db.flushQueue <- frozen
+	db.queueMu.Unlock()
+	if !full {
+		return nil
 	}
+
+	newActive, err := db.createState(nextID, nil)
+	if err == nil {
+		err = db.walSyncer.OnRotate(active.wal, newActive.wal)
+	}
+	if err != nil {
+		if newActive != nil && newActive.wal != nil {
+			_ = newActive.wal.Close()
+		}
+		db.mu.Lock()
+		db.rotating = false
+		db.rotationCond.Broadcast()
+		db.mu.Unlock()
+		db.rotationMu.Unlock()
+		return db.setWriteError(err)
+	}
+
+	db.queueMu.Lock()
+	db.mu.Lock()
+	active.table.Freeze()
+	frozen := &flushTask{state: active}
+	db.frozenMemtables = append(db.frozenMemtables, frozen)
+	db.flushPending++
+	db.active = newActive
+	db.nextMemtableID++
+	db.stats.MemTablesFrozen++
+	db.stats.MemTablesCreated++
+	db.mu.Unlock()
+
+	db.log(1, "[MEMTABLE] FULL id=%d size=%d threshold=%d", active.id, active.table.Size(), db.options.MemTableMaxSize)
+	db.log(1, "[MEMTABLE] FREEZE id=%d wal=%s", active.id, active.wal.Path())
+	db.log(1, "[MEMTABLE] CREATE id=%d wal=%s", newActive.id, newActive.wal.Path())
+	db.log(1, "[FLUSH QUEUE] ENQUEUE memtable=%d queue_length=%d", frozen.state.id, len(db.flushQueue)+1)
+	enqueueStart := time.Now()
+	db.flushQueue <- frozen
+	enqueueDuration := time.Since(enqueueStart)
+	if enqueueDuration > 10*time.Millisecond {
+		db.mu.Lock()
+		db.stats.QueueWaits++
+		db.stats.QueueWaitDuration += enqueueDuration
+		db.mu.Unlock()
+		db.log(1, "[WRITE] flush queue wait=%s memtable=%d", enqueueDuration, frozen.state.id)
+	}
+	db.queueMu.Unlock()
+
+	db.mu.Lock()
+	db.rotating = false
+	db.rotationCond.Broadcast()
+	db.mu.Unlock()
+	db.rotationMu.Unlock()
 	return nil
 }
 
@@ -462,15 +557,19 @@ func (db *DB) flush(task *flushTask) error {
 	start := time.Now()
 	db.log(1, "[FLUSH] START memtable=%d wal=%s", task.state.id, task.state.wal.Path())
 	blocks := sstable.SplitBlocks(task.state.table.Entries())
+	builderStart := time.Now()
 	sstable, err := db.flushBuilder.Build(task.state.table)
 	if err != nil {
 		return err
 	}
+	builderDuration := time.Since(builderStart)
 	db.log(1, "[SSTABLE BUILDER] DONE level=L0 blocks=%d size=%d", len(blocks), len(sstable.Data))
+	writeStart := time.Now()
 	result, err := db.flushStorage.WriteWithInfo(sstable)
 	if err != nil {
 		return err
 	}
+	writeDuration := time.Since(writeStart)
 	meta, err := tableMeta(result.ID, 0, sstable)
 	if err != nil {
 		return err
@@ -481,9 +580,11 @@ func (db *DB) flush(task *flushTask) error {
 	db.manifest.Tables = append(db.manifest.Tables, meta)
 	manifest := db.manifest
 	db.mu.Unlock()
+	manifestStart := time.Now()
 	if err := storage.WriteManifest(db.tablesDir, manifest); err != nil {
 		return err
 	}
+	manifestDuration := time.Since(manifestStart)
 	if err := task.state.wal.Close(); err != nil {
 		return err
 	}
@@ -496,7 +597,11 @@ func (db *DB) flush(task *flushTask) error {
 	db.mu.Lock()
 	db.stats.SSTableBytes += result.Size
 	db.stats.TotalSSTableBlocks += len(blocks)
+	db.stats.FlushDuration += time.Since(start)
 	db.mu.Unlock()
+	db.log(1, "[FLUSH] TIMING memtable=%d builder=%s storage=%s write=%s fsync=%s manifest=%s total=%s",
+		task.state.id, builderDuration, writeDuration, result.WriteTime, result.SyncTime,
+		manifestDuration, time.Since(start))
 	db.log(1, "[SSTABLE] WRITE level=L0 file=%s size=%d", result.Path, result.Size)
 	db.log(1, "[WAL] CLOSE+DELETE path=%s", task.state.wal.Path())
 	db.log(1, "[FLUSH] DONE memtable=%d duration=%s", task.state.id, time.Since(start))
@@ -525,6 +630,7 @@ func (db *DB) FlushStats() FlushStats {
 }
 
 func (db *DB) compactOneTriggeredLevel() (bool, error) {
+	start := time.Now()
 	tableStore, ok := db.flushStorage.(compactableStorage)
 	if !ok {
 		return false, nil
@@ -624,7 +730,16 @@ func (db *DB) compactOneTriggeredLevel() (bool, error) {
 			return false, err
 		}
 	}
-	db.log(1, "[COMPACTION] level=L%d inputs=%d output=%06d.sst", level, len(inputs), result.ID)
+	var inputBytes uint64
+	for _, input := range inputs {
+		inputBytes += input.Size
+	}
+	db.mu.Lock()
+	db.stats.Compactions++
+	db.stats.CompactionDuration += time.Since(start)
+	db.mu.Unlock()
+	db.log(1, "[COMPACTION] level=L%d inputs=%d input_bytes=%d output_bytes=%d output=%06d.sst duration=%s",
+		level, len(inputs), inputBytes, result.Size, result.ID, time.Since(start))
 	return true, nil
 }
 
@@ -644,6 +759,8 @@ func tableMeta(id uint64, level int, table *sstable.SSTable) (storage.TableMeta,
 func (db *DB) Close() error {
 	db.queueMu.Lock()
 	defer db.queueMu.Unlock()
+	db.rotationMu.Lock()
+	defer db.rotationMu.Unlock()
 	db.mu.Lock()
 	if db.closed {
 		db.mu.Unlock()
