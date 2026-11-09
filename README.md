@@ -5,7 +5,7 @@ RESP2-compatible TCP server.
 
 ## Architecture
 
-The project maintains a clean separation between the storage engine internals and the HTTP adapter layer:
+The project maintains a clean separation between the storage engine internals and the RESP2 server:
 
 ```text
                  External programs / redis-cli

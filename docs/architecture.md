@@ -4,7 +4,6 @@ This document records behavior found in the implementation. Paths are relative t
 
 ## Components
 
-- `cmd/lsm/main.go`: line-oriented CLI invoking `Put`, `Get`, and `Delete`.
 - `cmd/lsm-server/main.go`: opens the engine and serves TCP, with WAL sync and address options.
 - `internal/server/server.go`: accepts connections, parses commands through `internal/protocol`, and invokes a `Store` interface. It handles a bounded number of connections with a semaphore. `RANGE` currently returns an empty array; it is not an implemented scan.
 - `internal/protocol/{parse,encode,types}.go`: RESP request parsing, response encoding, and limits.
